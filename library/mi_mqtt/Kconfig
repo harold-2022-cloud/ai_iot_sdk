@@ -1,0 +1,23 @@
+menu "mi_mqtt"
+
+config MI_MQTT_HAVE_ESP_BROKER_LIVENESS
+    bool "esp-mqtt provides broker-liveness / pingresp-diag extension API"
+    default n
+    help
+      Enable only when the project's esp-mqtt ("mqtt") component is the
+      patched fork that exposes the broker-liveness / pingresp-diagnostics
+      extension API:
+        - esp_mqtt_client_get_broker_liveness()
+        - esp_mqtt_client_get_pingresp_state()
+        - esp_mqtt_client_get_pingresp_diag()
+        - esp_mqtt_broker_liveness_t / esp_mqtt_broker_liveness_snapshot_t
+
+      Stock ESP-IDF esp-mqtt does NOT provide these symbols. Leave this
+      disabled (default) to compile mi_mqtt against stock esp-mqtt: the
+      broker-liveness / pingresp snapshots then degrade gracefully —
+      Mqtt_Client_Broker_Liveness_Snapshot() reports the broker as READY
+      whenever the MQTT app layer is connected, deferring connection health
+      to esp-mqtt's built-in keepalive. The enhanced dead-broker detection /
+      force-reconnect watchdog is simply inactive in that mode.
+
+endmenu

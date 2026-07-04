@@ -1,0 +1,11 @@
+build/
+*.o
+*.obj
+*.a
+!chip_esp32s3/vendor/agora_iot_sdk/libs/
+!chip_esp32s3/vendor/agora_iot_sdk/libs/libagora-rtc-sdk.a
+!chip_esp32s3/vendor/agora_iot_sdk/libs/libaosl.a
+!chip_bk7258/vendor/aosl/libs/
+!chip_bk7258/vendor/aosl/libs/libaosl.a
+sdkconfig.old
+.DS_Store

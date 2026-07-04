@@ -1,0 +1,16 @@
+AI IoT SDK
+Copyright 2026 AI IoT SDK contributors
+
+本產品包含 AI IoT SDK，授權條款為 Apache License 2.0。
+
+本 repo 同時包含用於芯片 RTC 集成的 redistributable vendor binary/header baseline。這些文件用於讓 SDK 能在對應芯片上完成 Agora RTC/AOSL 集成：
+
+- `chip_esp32s3/vendor/agora_iot_sdk/include/agora_rtc_api.h`
+- `chip_esp32s3/vendor/agora_iot_sdk/include/autoconfig.h`
+- `chip_esp32s3/vendor/agora_iot_sdk/libs/libagora-rtc-sdk.a`
+- `chip_esp32s3/vendor/agora_iot_sdk/libs/libaosl.a`
+- `chip_bk7258/vendor/aosl/libs/libaosl.a`
+
+上述 vendor 文件仍受其原始供應商條款約束。SDK public API 不暴露 vendor-specific API；產品代碼應通過 SDK facade 使用 RTC，而不是直接依賴 vendor header 或 archive。
+
+如果替換 vendor archive/header，請同步更新 `docs/vendor-binaries.md`，並重新跑 SDK host/static verification 以及對應產品 build/runtime 驗證。
