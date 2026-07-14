@@ -18,6 +18,7 @@ PORTABLE_SDK_BASELINE = SDK / "docs/portable-sdk-baseline.md"
 RTC_FACADE = SDK / "media/rtc_facade"
 SDK_AGORA_DIR = RTC_FACADE / "src/agora"
 SDK_VENDOR_AGORA = SDK / "chip_esp32s3/vendor/agora_iot_sdk"
+SDK_BK7258_VENDOR_AGORA = SDK / "chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk"
 ESP_PRODUCT_AGORA = ESP_PRODUCT / "ai_components/network_transfer/agora_rtc"
 ESP_PRODUCT_NETWORK_CMAKE = ESP_PRODUCT / "ai_components/network_transfer/CMakeLists.txt"
 
@@ -68,6 +69,10 @@ def main() -> int:
         SDK_VENDOR_AGORA / "include/agora_rtc_api.h",
         SDK_VENDOR_AGORA / "libs/libagora-rtc-sdk.a",
         SDK_VENDOR_AGORA / "libs/libaosl.a",
+        SDK_BK7258_VENDOR_AGORA / "CMakeLists.txt",
+        SDK_BK7258_VENDOR_AGORA / "include/bk7258/agora_rtc_api.h",
+        SDK_BK7258_VENDOR_AGORA / "bk7258/libs/librtsa.a",
+        SDK_BK7258_VENDOR_AGORA / "bk7258/libs/libagora-cjson.a",
     )
     for path in required_sdk_files:
         if not path.exists():
@@ -113,6 +118,23 @@ def main() -> int:
     ):
         if symbol not in vendor_symbols:
             failures.append(f"SDK ESP32S3 Agora vendor archive missing symbol: {symbol}")
+
+    rtc_facade_cmake = read(RTC_FACADE / "CMakeLists.txt")
+    if "PRIV_REQUIRES ai_iot_bk7258_agora_iot_sdk json" not in rtc_facade_cmake:
+        failures.append("BK7258 rtc_facade must depend on SDK-owned ai_iot_bk7258_agora_iot_sdk component")
+    if "PRIV_REQUIRES agora-iot-sdk json" in rtc_facade_cmake:
+        failures.append("BK7258 rtc_facade must not depend on Beken SDK agora-iot-sdk component name")
+
+    bk7258_vendor_cmake = read(SDK_BK7258_VENDOR_AGORA / "CMakeLists.txt")
+    for token in (
+        "include/bk7258",
+        "hal/aosl/include",
+        "hal/agora_thread.c",
+        "bk7258/libs/*.a",
+        "target_link_libraries(${COMPONENT_LIB} INTERFACE ${lib_name})",
+    ):
+        if token not in bk7258_vendor_cmake:
+            failures.append(f"SDK BK7258 Agora vendor component CMake missing token: {token}")
 
     public_text = read(PUBLIC_HEADER)
     forbidden_public_tokens = (
@@ -189,6 +211,9 @@ def main() -> int:
         "chip_esp32s3/vendor/agora_iot_sdk/libs/libagora-rtc-sdk.a",
         "chip_esp32s3/vendor/agora_iot_sdk/libs/libaosl.a",
         "chip_bk7258/vendor/aosl/libs/libaosl.a",
+        "chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/librtsa.a",
+        "chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/libagora-cjson.a",
+        "ai_iot_bk7258_agora_iot_sdk",
         "rand_bytes",
         "mbedtls",
     ):

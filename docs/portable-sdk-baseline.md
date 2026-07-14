@@ -32,6 +32,13 @@ BK7258 AOSL baseline archive:
 
 - `chip_bk7258/vendor/aosl/libs/libaosl.a`
 
+BK7258 Agora RTC vendor component:
+
+- `chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/include/bk7258/agora_rtc_api.h`
+- `chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/librtsa.a`
+- `chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/libagora-cjson.a`
+- `chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/hal/aosl`
+
 When updating Agora/AOSL vendor archives, verify that platform symbols are
 provided by exactly one layer. In particular, avoid duplicate `rand_bytes`
 definitions between Agora vendor objects and platform mbedtls/PSA objects.
@@ -41,6 +48,12 @@ definitions between Agora vendor objects and platform mbedtls/PSA objects.
 - Products should consume RTC through `ai_rtc_facade.h`.
 - Products should not directly include Agora vendor headers.
 - Products should not directly link Agora vendor archives.
+- BK7258 products that use the SDK RTC facade should add
+  `chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk` to their component search
+  path so the SDK private Agora component is selected instead of a product-local
+  or Beken SDK tree vendor copy.
+- BK7258 products should exclude the Beken SDK built-in `agora-iot-sdk`
+  component when the SDK-owned `ai_iot_bk7258_agora_iot_sdk` component is used.
 - RTM/datastream backend selection is private build-time SDK integration, not a
   public facade selector.
 

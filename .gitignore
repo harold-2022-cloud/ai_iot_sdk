@@ -7,5 +7,8 @@ build/
 !chip_esp32s3/vendor/agora_iot_sdk/libs/libaosl.a
 !chip_bk7258/vendor/aosl/libs/
 !chip_bk7258/vendor/aosl/libs/libaosl.a
+!chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/
+!chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/librtsa.a
+!chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/libagora-cjson.a
 sdkconfig.old
 .DS_Store

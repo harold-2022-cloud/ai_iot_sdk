@@ -19,6 +19,15 @@ BK7258 AOSL baseline：
 chip_bk7258/vendor/aosl/libs/libaosl.a
 ```
 
+BK7258 Agora RTC baseline：
+
+```text
+chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/include/bk7258/agora_rtc_api.h
+chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/librtsa.a
+chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/bk7258/libs/libagora-cjson.a
+chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk/hal/aosl/
+```
+
 ## 使用原則
 
 - vendor API 只能在 SDK private backend 或 chip port 中使用；
@@ -30,6 +39,22 @@ chip_bk7258/vendor/aosl/libs/libaosl.a
 ## Beken baseline 注意事項
 
 BK7258 的 Agora/AOSL/mbedtls link 順序和 symbol 可能受 Beken SDK 版本影響。過去曾遇到 `rand_bytes` multiple definition，原因是 Agora archive 和 Beken `psa_mbedtls` 同時提供相同 symbol。
+
+BK7258 產品應把 SDK 內的下列 component 加到 project `EXTRA_COMPONENTS_DIRS`：
+
+```text
+ai_iot_sdk/chip_bk7258/vendor/ai_iot_bk7258_agora_iot_sdk
+```
+
+這會讓 `rtc_facade` 的 private dependency `ai_iot_bk7258_agora_iot_sdk` 使用 SDK 自帶的 BK7258 Agora RTC vendor component，而不是產品或 Beken SDK tree 內的另一份 vendor component。component 名稱刻意不使用 Beken SDK 內建的 `agora-iot-sdk`，避免 Armino dependency 解析時選到 Beken SDK tree 內的同名 component。
+
+如果 Beken SDK tree 內也帶有 `agora-iot-sdk` component，產品 project 應加入：
+
+```cmake
+set(EXCLUDE_COMPONENTS agora-iot-sdk)
+```
+
+這樣 build graph 不會同時編進 Beken SDK 內建 vendor component 和 SDK 自帶 vendor component。
 
 處理原則：
 

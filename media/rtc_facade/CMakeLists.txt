@@ -17,7 +17,7 @@ if(COMMAND armino_component_register)
     armino_component_register(
         SRCS "${srcs}"
         INCLUDE_DIRS "${incs}"
-        PRIV_REQUIRES agora-iot-sdk json
+        PRIV_REQUIRES ai_iot_bk7258_agora_iot_sdk json
     )
 endif()
 
