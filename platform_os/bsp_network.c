@@ -36,6 +36,29 @@ extern const char *gai_strerror(int err);
 
 #define STRING_PTR_PRINT_SANITY_CHECK(ptr) ((ptr) ? (ptr) : "null")
 
+#define TCP_READ_TIMEOUT_DIAG_INTERVAL_MS 2000U
+
+static uint32_t s_tcp_read_timeout_count = 0U;
+static uint32_t s_tcp_read_timeout_last_log_ms = 0U;
+
+static int Bsp_Network_Get_Socket_Error(int fd)
+{
+    int error = 0;
+    socklen_t len = sizeof(error);
+
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0)
+    {
+        return -1;
+    }
+
+    return error;
+}
+
 /* Some embedded/lwIP builds don't expose gai_strerror; provide a safe fallback
  * that returns a small string representation of the error code. This avoids
  * implicit declaration errors when gai_strerror isn't available.
@@ -51,6 +74,20 @@ static const char *bsp_gai_strerror_safe(int err)
 //TCP上下文
 struct Tcp_Context {
 	int Fd;
+    uint32_t Generation;
+    uint32_t Active_Reads;
+    uint32_t Active_Writes;
+    uint32_t Close_Count;
+    int Last_Read_Ret;
+    int Last_Read_Errno;
+    int Last_Read_Select_Ret;
+    int Last_Read_So_Error;
+    uint32_t Last_Read_Elapsed_Ms;
+    int Last_Write_Ret;
+    int Last_Write_Errno;
+    int Last_Write_Select_Ret;
+    int Last_Write_So_Error;
+    uint32_t Last_Write_Elapsed_Ms;
 };
 
 struct Tls_Context {
@@ -253,6 +290,21 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
 
 	tcp_data_params = (Tcp_Context_t*)(pNetwork->Tcp_Context);
 
+    if (tcp_data_params->Fd >= 0)
+    {
+        int old_fd = tcp_data_params->Fd;
+        NET_WORK_LOG("[NET_DIAG][PRECONNECT_CLOSE_STALE_FD] fd=%d gen=%u active_r=%u active_w=%u close_count=%u\r\n",
+                     old_fd,
+                     (unsigned int)tcp_data_params->Generation,
+                     (unsigned int)tcp_data_params->Active_Reads,
+                     (unsigned int)tcp_data_params->Active_Writes,
+                     (unsigned int)tcp_data_params->Close_Count);
+        shutdown(old_fd, SHUT_RDWR);
+        close(old_fd);
+        tcp_data_params->Fd = -1;
+        tcp_data_params->Close_Count++;
+    }
+
 	struct addrinfo hints, *addr_list, *cur;
 	int fd = -1;
 	char port_str[6] = {0};
@@ -302,8 +354,12 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
          * 導致 PUBACK / PINGRESP 全部漏收 → MQTTKeepAliveTimeout。
          * Network_Tcp_Read 已用 select(200ms) 自帶超時，移除 socket-level timeout。*/
         int on = 1;
-        setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  (void *)&on, sizeof(int));
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,   (void *)&on, sizeof(int));
+        errno = 0;
+        int so_keepalive_ret = setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  (void *)&on, sizeof(int));
+        int so_keepalive_errno = errno;
+        errno = 0;
+        int tcp_nodelay_ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,   (void *)&on, sizeof(int));
+        int tcp_nodelay_errno = errno;
         /* TCP keepalive 在 MQTT keepalive(25s) 之前先探測，雙重保障。
          * KEEPIDLE=15s：最後一次 TCP 收發後 15s 開始探測（< MQTT keepalive 25s）
          * KEEPINTVL=3s, KEEPCNT=3：3×3=9s 後仍無回應則關 socket
@@ -311,9 +367,24 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
         int keepidle  = 15;
         int keepintvl =  3;
         int keepcnt   =  3;
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keepidle,  sizeof(keepidle));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keepcnt,   sizeof(keepcnt));
+        errno = 0;
+        int tcp_keepidle_ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keepidle,  sizeof(keepidle));
+        int tcp_keepidle_errno = errno;
+        errno = 0;
+        int tcp_keepintvl_ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+        int tcp_keepintvl_errno = errno;
+        errno = 0;
+        int tcp_keepcnt_ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keepcnt,   sizeof(keepcnt));
+        int tcp_keepcnt_errno = errno;
+        NET_WORK_LOG("[NET_DIAG][TCP_KEEPALIVE_OPT] fd=%d keepalive_ret=%d errno=%d "
+                     "nodelay_ret=%d errno=%d keepidle=%d ret=%d errno=%d "
+                     "keepintvl=%d ret=%d errno=%d keepcnt=%d ret=%d errno=%d\r\n",
+                     fd,
+                     so_keepalive_ret, so_keepalive_errno,
+                     tcp_nodelay_ret, tcp_nodelay_errno,
+                     keepidle, tcp_keepidle_ret, tcp_keepidle_errno,
+                     keepintvl, tcp_keepintvl_ret, tcp_keepintvl_errno,
+                     keepcnt, tcp_keepcnt_ret, tcp_keepcnt_errno);
 
         char srv_ip[64] = {0};
         struct sockaddr_in *addr_in = (struct sockaddr_in *)cur->ai_addr;
@@ -330,6 +401,14 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
           
             ret = fd;
             tcp_data_params->Fd = fd;
+            tcp_data_params->Generation++;
+            NET_WORK_LOG("[NET_DIAG][FD_OPEN] fd=%d gen=%u local_port=%d active_r=%u active_w=%u close_count=%u\r\n",
+                         fd,
+                         (unsigned int)tcp_data_params->Generation,
+                         pNetwork->Interface_Info.Local_Port,
+                         (unsigned int)tcp_data_params->Active_Reads,
+                         (unsigned int)tcp_data_params->Active_Writes,
+                         (unsigned int)tcp_data_params->Close_Count);
             break;
         }
 		else{
@@ -360,12 +439,50 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
 int Network_Tcp_Disconnect(Network_Context_t *pNetwork) 
 {
 	Tcp_Context_t *tcp_data_params = (pNetwork->Tcp_Context);
+    int fd = tcp_data_params->Fd;
+    uint32_t gen = tcp_data_params->Generation;
 
-    NET_WORK_LOG("close socket fd: %d\r\n", tcp_data_params->Fd);
-    if(tcp_data_params->Fd >= 0) {
-        close(tcp_data_params->Fd);
+    int so_error = Bsp_Network_Get_Socket_Error(fd);
+    NET_WORK_LOG("[NET_DIAG][SOCKET_BEFORE_CLOSE] fd=%d gen=%u so_error=%d "
+                 "last_read_ret=%d last_read_errno=%d last_read_select=%d last_read_so_error=%d last_read_elapsed=%u "
+                 "last_write_ret=%d last_write_errno=%d last_write_select=%d last_write_so_error=%d last_write_elapsed=%u "
+                 "active_r=%u active_w=%u close_count=%u\r\n",
+                 fd,
+                 (unsigned int)gen,
+                 so_error,
+                 tcp_data_params->Last_Read_Ret,
+                 tcp_data_params->Last_Read_Errno,
+                 tcp_data_params->Last_Read_Select_Ret,
+                 tcp_data_params->Last_Read_So_Error,
+                 (unsigned int)tcp_data_params->Last_Read_Elapsed_Ms,
+                 tcp_data_params->Last_Write_Ret,
+                 tcp_data_params->Last_Write_Errno,
+                 tcp_data_params->Last_Write_Select_Ret,
+                 tcp_data_params->Last_Write_So_Error,
+                 (unsigned int)tcp_data_params->Last_Write_Elapsed_Ms,
+                 (unsigned int)tcp_data_params->Active_Reads,
+                 (unsigned int)tcp_data_params->Active_Writes,
+                 (unsigned int)tcp_data_params->Close_Count);
+    NET_WORK_LOG("[NET_DIAG][FD_CLOSE_BEGIN] fd=%d gen=%u active_r=%u active_w=%u close_count=%u\r\n",
+                 fd,
+                 (unsigned int)gen,
+                 (unsigned int)tcp_data_params->Active_Reads,
+                 (unsigned int)tcp_data_params->Active_Writes,
+                 (unsigned int)tcp_data_params->Close_Count);
+    NET_WORK_LOG("close socket fd: %d\r\n", fd);
+    if(fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
         tcp_data_params->Fd = -1;
     }
+    tcp_data_params->Close_Count++;
+    NET_WORK_LOG("[NET_DIAG][FD_CLOSE_END] fd=%d gen=%u active_r=%u active_w=%u close_count=%u now_fd=%d\r\n",
+                 fd,
+                 (unsigned int)gen,
+                 (unsigned int)tcp_data_params->Active_Reads,
+                 (unsigned int)tcp_data_params->Active_Writes,
+                 (unsigned int)tcp_data_params->Close_Count,
+                 tcp_data_params->Fd);
     memset(&pNetwork->Interface_Info, 0, sizeof(pNetwork->Interface_Info));
 	return 0;
 }
@@ -414,8 +531,27 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
 
     int fd = tcp_data_params->Fd;
     if(fd < 0){
+        NET_WORK_LOG("[NET_DIAG][WRITE_INVALID_FD] fd=%d gen=%u active_r=%u active_w=%u close_count=%u len=%u\r\n",
+                     fd,
+                     (unsigned int)tcp_data_params->Generation,
+                     (unsigned int)tcp_data_params->Active_Reads,
+                     (unsigned int)tcp_data_params->Active_Writes,
+                     (unsigned int)tcp_data_params->Close_Count,
+                     (unsigned int)len);
         NET_WORK_LOG("invalid socket fd: %d\r\n", fd);
         return NET_INVALID_PARM;
+    }
+    uint32_t fd_generation = tcp_data_params->Generation;
+    tcp_data_params->Active_Writes++;
+    if (len <= 2U)
+    {
+        NET_WORK_LOG("[NET_DIAG][WRITE_BEGIN] fd=%d gen=%u len=%u active_r=%u active_w=%u close_count=%u\r\n",
+                     (int)fd,
+                     (unsigned int)fd_generation,
+                     (unsigned int)len,
+                     (unsigned int)tcp_data_params->Active_Reads,
+                     (unsigned int)tcp_data_params->Active_Writes,
+                     (unsigned int)tcp_data_params->Close_Count);
     }
 
     uint32_t timeout_ms = 200;
@@ -424,6 +560,8 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
     uint32_t start_ms = Bsp_Get_Run_Time_Ms();
     uint32_t select_ready_count = 0;
     uint32_t send_call_count = 0;
+    int last_errno = 0;
+    int last_select_ret = 0;
     t_end    = Bsp_Get_Run_Time_Ms() + timeout_ms;
     len_sent = 0;
     ret      = 1; /* send one time if timeout_ms is value 0 */
@@ -438,7 +576,9 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
 
             timeout.tv_sec  = t_left / 1000;
             timeout.tv_usec = (t_left % 1000) * 1000;  
-            ret = select(fd + 1, NULL, &sets, NULL, &timeout); 
+            errno = 0;
+            ret = select(fd + 1, NULL, &sets, NULL, &timeout);
+            last_select_ret = ret;
             if (ret > 0) 
 			{
                 select_ready_count++;
@@ -462,6 +602,7 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
             } 
 			else 
 			{
+                last_errno = errno;
                 if (EINTR == errno) 
 				{
                     NET_WORK_LOG("EINTR be caught\r\n");
@@ -482,7 +623,8 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
         if (ret > 0) 
 		{ 
             size_t want_len = len - len_sent;
-            ret = send(fd, buf + len_sent, len - len_sent, MSG_NOSIGNAL); 
+            errno = 0;
+            ret = send(fd, buf + len_sent, len - len_sent, MSG_NOSIGNAL);
             send_call_count++;
             if (ret > 0)
             {
@@ -503,6 +645,7 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
             }
             else 
             {
+                last_errno = errno;
                 if (EINTR == errno)
                 {
                     NET_WORK_LOG("EINTR be caught\r\n");
@@ -510,18 +653,63 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
                 }
 
                 ret = NET_FAILED;
-                NET_WORK_LOG("[NET_DIAG][WRITE_SEND_FAIL] fd=%d errno=%d(%s) sent=%u/%u calls=%u ready=%u\r\n",
+                NET_WORK_LOG("[NET_DIAG][WRITE_SEND_FAIL] fd=%d gen=%u now_fd=%d now_gen=%u errno=%d(%s) "
+                             "sent=%u/%u calls=%u ready=%u active_r=%u active_w=%u close_count=%u\r\n",
                              (int)fd,
+                             (unsigned int)fd_generation,
+                             tcp_data_params->Fd,
+                             (unsigned int)tcp_data_params->Generation,
                              errno,
                              STRING_PTR_PRINT_SANITY_CHECK(strerror(errno)),
                              (unsigned int)len_sent,
                              (unsigned int)len,
                              (unsigned int)send_call_count,
-                             (unsigned int)select_ready_count);
+                             (unsigned int)select_ready_count,
+                             (unsigned int)tcp_data_params->Active_Reads,
+                             (unsigned int)tcp_data_params->Active_Writes,
+                             (unsigned int)tcp_data_params->Close_Count);
                 break;
             }
         } 
     } while ((len_sent < len) && (_Time_Left(t_end, Bsp_Get_Run_Time_Ms()) > 0));
+
+    if ((tcp_data_params->Fd != fd) || (tcp_data_params->Generation != fd_generation))
+    {
+        NET_WORK_LOG("[NET_DIAG][WRITE_FD_CHANGED] fd=%d gen=%u now_fd=%d now_gen=%u len=%u sent=%u elapsed=%u\r\n",
+                     (int)fd,
+                     (unsigned int)fd_generation,
+                     tcp_data_params->Fd,
+                     (unsigned int)tcp_data_params->Generation,
+                     (unsigned int)len,
+                     (unsigned int)len_sent,
+                     (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms));
+    }
+
+    if (len <= 2U)
+    {
+        NET_WORK_LOG("[NET_DIAG][WRITE_END] fd=%d gen=%u now_fd=%d now_gen=%u len=%u sent=%u ret=%d elapsed=%u "
+                     "active_r=%u active_w=%u close_count=%u\r\n",
+                     (int)fd,
+                     (unsigned int)fd_generation,
+                     tcp_data_params->Fd,
+                     (unsigned int)tcp_data_params->Generation,
+                     (unsigned int)len,
+                     (unsigned int)len_sent,
+                     ret,
+                     (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms),
+                     (unsigned int)tcp_data_params->Active_Reads,
+                     (unsigned int)tcp_data_params->Active_Writes,
+                     (unsigned int)tcp_data_params->Close_Count);
+    }
+    tcp_data_params->Last_Write_Ret = ret;
+    tcp_data_params->Last_Write_Errno = last_errno;
+    tcp_data_params->Last_Write_Select_Ret = last_select_ret;
+    tcp_data_params->Last_Write_So_Error = Bsp_Network_Get_Socket_Error(fd);
+    tcp_data_params->Last_Write_Elapsed_Ms = Bsp_Get_Run_Time_Ms() - start_ms;
+    if (tcp_data_params->Active_Writes > 0U)
+    {
+        tcp_data_params->Active_Writes--;
+    }
 
     if(len_sent == len)
     {
@@ -569,6 +757,8 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
     uint32_t       eagain_count;
     uint32_t       select_ready_count;
     uint32_t       recv_call_count;
+    int            last_errno;
+    int            last_select_ret;
 
     Tcp_Context_t *tcp_data_params = (Tcp_Context_t*)(pNetwork->Tcp_Context);
     if(NULL == tcp_data_params){
@@ -578,9 +768,18 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
 
     int fd = tcp_data_params->Fd;
     if(fd < 0){
+        NET_WORK_LOG("[NET_DIAG][READ_INVALID_FD] fd=%d gen=%u active_r=%u active_w=%u close_count=%u len=%u\r\n",
+                     fd,
+                     (unsigned int)tcp_data_params->Generation,
+                     (unsigned int)tcp_data_params->Active_Reads,
+                     (unsigned int)tcp_data_params->Active_Writes,
+                     (unsigned int)tcp_data_params->Close_Count,
+                     (unsigned int)len);
         NET_WORK_LOG("invalid socket fd: %d\r\n", fd);
         return NET_INVALID_PARM;
     }
+    uint32_t fd_generation = tcp_data_params->Generation;
+    tcp_data_params->Active_Reads++;
 
     uint32_t timeout_ms = 200;
     unsigned char *buf = pMsg;
@@ -592,6 +791,8 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
     eagain_count = 0;
     select_ready_count = 0;
     recv_call_count = 0;
+    last_errno = 0;
+    last_select_ret = 0;
 
     do {
         t_left = _Time_Left(t_end, Bsp_Get_Run_Time_Ms());
@@ -604,10 +805,13 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
         timeout.tv_sec  = t_left / 1000;
         timeout.tv_usec = (t_left % 1000) * 1000;
 
+        errno = 0;
         ret = select(fd + 1, &sets, NULL, NULL, &timeout);
+        last_select_ret = ret;
         if (ret > 0) 
 		{
             select_ready_count++;
+            errno = 0;
             ret = recv(fd, buf + len_recv, len - len_recv, 0);
             recv_call_count++;
             if (ret > 0) 
@@ -616,18 +820,24 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
             } 
 			else if (0 == ret) 
 			{
-                NET_WORK_LOG("[NET_DIAG][READ_EOF] fd=%d recv=%u/%u elapsed=%u ready=%u calls=%u\r\n",
+                NET_WORK_LOG("[NET_DIAG][READ_EOF] fd=%d gen=%u recv=%u/%u elapsed=%u ready=%u calls=%u "
+                             "active_r=%u active_w=%u close_count=%u\r\n",
                              (int)fd,
+                             (unsigned int)fd_generation,
                              (unsigned int)len_recv,
                              (unsigned int)len,
                              (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms),
                              (unsigned int)select_ready_count,
-                             (unsigned int)recv_call_count);
+                             (unsigned int)recv_call_count,
+                             (unsigned int)tcp_data_params->Active_Reads,
+                             (unsigned int)tcp_data_params->Active_Writes,
+                             (unsigned int)tcp_data_params->Close_Count);
                 err_code = NET_CONN_EOF;
                 break;
             } 
 			else
 			{
+                last_errno = errno;
                 if (EINTR == errno) {
                     NET_WORK_LOG("EINTR be caught\r\n");
                     continue;
@@ -637,13 +847,20 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
                     eagain_count++;
                     continue;
                 }
-                NET_WORK_LOG("[NET_DIAG][READ_RECV_ERROR] fd=%d errno=%d(%s) recv=%u/%u eagain=%u\r\n",
+                NET_WORK_LOG("[NET_DIAG][READ_RECV_ERROR] fd=%d gen=%u now_fd=%d now_gen=%u errno=%d(%s) "
+                             "recv=%u/%u eagain=%u active_r=%u active_w=%u close_count=%u\r\n",
                              (int)fd,
+                             (unsigned int)fd_generation,
+                             tcp_data_params->Fd,
+                             (unsigned int)tcp_data_params->Generation,
                              errno,
                              STRING_PTR_PRINT_SANITY_CHECK(strerror(errno)),
                              (unsigned int)len_recv,
                              (unsigned int)len,
-                             (unsigned int)eagain_count);
+                             (unsigned int)eagain_count,
+                             (unsigned int)tcp_data_params->Active_Reads,
+                             (unsigned int)tcp_data_params->Active_Writes,
+                             (unsigned int)tcp_data_params->Close_Count);
                 err_code = NET_FAILED;
                 break;
             }
@@ -655,13 +872,21 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
         } 
 		else 
 		{
-            NET_WORK_LOG("[NET_DIAG][READ_SELECT_ERROR] fd=%d errno=%d(%s) recv=%u/%u eagain=%u\r\n",
+            last_errno = errno;
+            NET_WORK_LOG("[NET_DIAG][READ_SELECT_ERROR] fd=%d gen=%u now_fd=%d now_gen=%u errno=%d(%s) "
+                         "recv=%u/%u eagain=%u active_r=%u active_w=%u close_count=%u\r\n",
                          (int)fd,
+                         (unsigned int)fd_generation,
+                         tcp_data_params->Fd,
+                         (unsigned int)tcp_data_params->Generation,
                          errno,
                          STRING_PTR_PRINT_SANITY_CHECK(strerror(errno)),
                          (unsigned int)len_recv,
                          (unsigned int)len,
-                         (unsigned int)eagain_count);
+                         (unsigned int)eagain_count,
+                         (unsigned int)tcp_data_params->Active_Reads,
+                         (unsigned int)tcp_data_params->Active_Writes,
+                         (unsigned int)tcp_data_params->Close_Count);
             err_code = NET_FAILED;
             break;
         }
@@ -679,6 +904,77 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
                      (unsigned int)recv_call_count,
                      err_code);
     }
+
+    if ((err_code == NET_TIMEOUT) && (len_recv == 0U))
+    {
+        uint32_t now_ms = Bsp_Get_Run_Time_Ms();
+        s_tcp_read_timeout_count++;
+        if ((s_tcp_read_timeout_count <= 3U) ||
+            (now_ms - s_tcp_read_timeout_last_log_ms >= TCP_READ_TIMEOUT_DIAG_INTERVAL_MS))
+        {
+            s_tcp_read_timeout_last_log_ms = now_ms;
+            int so_error = Bsp_Network_Get_Socket_Error(fd);
+            NET_WORK_LOG("[NET_DIAG][READ_SELECT_TIMEOUT_ONLY] fd=%d gen=%u now_fd=%d now_gen=%u wanted=%u elapsed=%u "
+                         "select_ret=0 timeout_only=1 ready=%u calls=%u eagain=%u timeout_count=%u so_error=%d "
+                         "active_r=%u active_w=%u close_count=%u\r\n",
+                         (int)fd,
+                         (unsigned int)fd_generation,
+                         tcp_data_params->Fd,
+                         (unsigned int)tcp_data_params->Generation,
+                         (unsigned int)len,
+                         (unsigned int)(now_ms - start_ms),
+                         (unsigned int)select_ready_count,
+                         (unsigned int)recv_call_count,
+                         (unsigned int)eagain_count,
+                         (unsigned int)s_tcp_read_timeout_count,
+                         so_error,
+                         (unsigned int)tcp_data_params->Active_Reads,
+                         (unsigned int)tcp_data_params->Active_Writes,
+                         (unsigned int)tcp_data_params->Close_Count);
+        }
+    }
+    else if (len_recv > 0U)
+    {
+        if (s_tcp_read_timeout_count > 0U)
+        {
+            NET_WORK_LOG("[NET_DIAG][READ_RECOVER] fd=%d gen=%u recv=%u/%u after_timeout_count=%u "
+                         "elapsed=%u ready=%u calls=%u active_r=%u active_w=%u close_count=%u\r\n",
+                         (int)fd,
+                         (unsigned int)fd_generation,
+                         (unsigned int)len_recv,
+                         (unsigned int)len,
+                         (unsigned int)s_tcp_read_timeout_count,
+                         (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms),
+                         (unsigned int)select_ready_count,
+                         (unsigned int)recv_call_count,
+                         (unsigned int)tcp_data_params->Active_Reads,
+                         (unsigned int)tcp_data_params->Active_Writes,
+                         (unsigned int)tcp_data_params->Close_Count);
+        }
+        s_tcp_read_timeout_count = 0U;
+    }
+
+    if ((tcp_data_params->Fd != fd) || (tcp_data_params->Generation != fd_generation))
+    {
+        NET_WORK_LOG("[NET_DIAG][READ_FD_CHANGED] fd=%d gen=%u now_fd=%d now_gen=%u recv=%u/%u err=%d elapsed=%u\r\n",
+                     (int)fd,
+                     (unsigned int)fd_generation,
+                     tcp_data_params->Fd,
+                     (unsigned int)tcp_data_params->Generation,
+                     (unsigned int)len_recv,
+                     (unsigned int)len,
+                     err_code,
+                     (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms));
+    }
+    if (tcp_data_params->Active_Reads > 0U)
+    {
+        tcp_data_params->Active_Reads--;
+    }
+    tcp_data_params->Last_Read_Ret = err_code;
+    tcp_data_params->Last_Read_Errno = last_errno;
+    tcp_data_params->Last_Read_Select_Ret = last_select_ret;
+    tcp_data_params->Last_Read_So_Error = Bsp_Network_Get_Socket_Error(fd);
+    tcp_data_params->Last_Read_Elapsed_Ms = Bsp_Get_Run_Time_Ms() - start_ms;
 
     if((err_code != 0) && (err_code != NET_TIMEOUT)){
         return err_code;
@@ -1648,23 +1944,6 @@ int Bsp_Network_Socket_Close(int sockfd)
     }
     return 0;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

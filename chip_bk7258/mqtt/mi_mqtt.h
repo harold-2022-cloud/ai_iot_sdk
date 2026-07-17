@@ -98,6 +98,7 @@ typedef struct MQTTContext
     uint16_t keepAliveIntervalSec;//保活周期秒数
     uint32_t pingReqSendTimeMs;   //发送最后一个PING数据包的时间戳
     bool waitingForPingResp;      //等待PING应答的标志
+    uint32_t pingRespRecvTimeMs;  //收到最后一个PINGRESP数据包的时间戳
     void * userData;//用户数据
 
     void* mutex;

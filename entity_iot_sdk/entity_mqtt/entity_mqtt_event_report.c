@@ -1002,6 +1002,14 @@ void Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id
                         has_persona ? persona_id : "(none)",
                         has_language ? language : "(none)",
                         pub_ms);
+    ENTITY_LOGI("[MQTT_TRACE][T2_TOKEN_BUILT] mono_ms=%" PRIu64 " msgId=%s qos=%d ack=%d "
+                "persona=%s language=%s\r\n",
+                pub_ms,
+                msgId,
+                ENTITY_AGORA_DEVICE_ACCESS_QOS,
+                ack,
+                has_persona ? persona_id : "(none)",
+                has_language ? language : "(none)");
     AI_HOTPATH_VERBOSE_DO(
         ENTITY_LOGI("[RTC_TOKEN] request agora_agent_device_access: msgId=%s personaId=%s language=%s mono_t=%" PRIu64 "ms\r\n",
                   msgId,

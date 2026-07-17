@@ -376,6 +376,19 @@ def main() -> int:
                 failures.append(f"SDK Agora service {function_name} missing send snapshot token: {token}")
     if "s_agora.stale_callbacks = 0u" not in service_text:
         failures.append("SDK Agora service must reset stale_callbacks when session state is reset")
+    stale_match = re.search(
+        r"static\s+bool\s+service_accept_callback\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
+        service_text,
+        re.S,
+    )
+    if stale_match is None:
+        failures.append("SDK Agora service missing service_accept_callback")
+    else:
+        stale_body = stale_match.group("body")
+        if "callback stale conn=" not in stale_body:
+            failures.append("SDK Agora service must keep stale callback diagnostics")
+        if "service_should_log_counter(&s_agora.stale_callbacks)" not in stale_body:
+            failures.append("SDK Agora service stale callback diagnostics must be throttled")
     shutdown_match = re.search(
         r"static\s+int\s+service_shutdown_sdk\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
         service_text,

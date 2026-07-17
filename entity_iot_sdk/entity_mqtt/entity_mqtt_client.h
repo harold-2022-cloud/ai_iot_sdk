@@ -56,6 +56,8 @@ struct Entity_Mqtt_Context{
     uint8_t State;
     bool Prohibit_Connect;                  //禁止连接
     bool Is_Connected;
+    volatile bool Reconnect_Pending;        //由外部 task 请求，实际重连只在 MQTT task 执行
+    char Reconnect_Reason[48];
 };
 
 //MQTT消息结构体
@@ -88,7 +90,7 @@ char *Entity_Mqtt_Get_Topic(Topic_Type_e type_e);
 //犀云MQTT客户端主动断开连接
 int Entity_Mqtt_Manu_Disconnect(Entity_Mqtt_Context_t* context);
 
-//犀云MQTT客户端主动触发重连（不禁止后续自动连接）
+//犀云MQTT客户端请求重连（不禁止后续自动连接；实际 close/reconnect 由 MQTT task 执行）
 int Entity_Mqtt_Force_Reconnect(Entity_Mqtt_Context_t* context, const char *reason);
 
 /* 犀云MQTT客户端工作状态机

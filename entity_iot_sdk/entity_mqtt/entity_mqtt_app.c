@@ -18,6 +18,21 @@
 #include "entity_msg_queue.h"
 #include "entity_config_net.h" /* 用于停止配网超时定时器 */
 
+#if defined(__has_include)
+#if __has_include("FreeRTOS.h") && __has_include("task.h")
+#include "FreeRTOS.h"
+#include "task.h"
+#define ENTITY_MQTT_HAVE_TASK_DIAG 1
+#elif __has_include("freertos/FreeRTOS.h") && __has_include("freertos/task.h")
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#define ENTITY_MQTT_HAVE_TASK_DIAG 1
+#endif
+#endif
+#ifndef ENTITY_MQTT_HAVE_TASK_DIAG
+#define ENTITY_MQTT_HAVE_TASK_DIAG 0
+#endif
+
 /* 开发者模式下使用的 MQTT 地址 */
 #define DEV_MODE_NVS_KEY   "dev_mode"
 #define DEV_MODE_MQTT_HOST "192.168.31.112"
@@ -58,7 +73,7 @@ static volatile bool s_mqtt_app_connected = false;
 
 /* ── coreMQTT-Agent 指令隊列 ─────────────────────────────────────────────
  * 原則：所有 MQTT_Publish 操作只能由 Agent Task（Entity_Mqtt_Client_Task）
- * 在 Entity_Mqtt_Loop() 返回後執行，外部 Task 及 ProcessLoop 內部的
+ * 在 Entity_Mqtt_Loop() 前後的安全點執行，外部 Task 及 ProcessLoop 內部的
  * callback 只能非阻塞 post 指令到隊列，絕不在 callback 鏈中呼叫 Publish。
  * 好處：徹底消除「callback 中重入 MQTT_Publish」導致的 mutex 死鎖。*/
 
@@ -77,6 +92,9 @@ typedef struct
     int                         len;
     int                         qos;
     int                         retained;
+    uint32_t                    trace_seq;
+    uint32_t                    enqueue_ms;
+    bool                        ai_access;
 } Entity_Mqtt_Agent_Cmd_t;
 
 #define ENTITY_MQTT_AGENT_QUEUE_SIZE  16
@@ -85,6 +103,52 @@ static uint32_t s_last_queue_wait_log_ms = 0;
 static uint32_t s_last_app_heartbeat_ms = 0;
 static volatile bool s_connected_post_pending = false;
 static volatile uint32_t s_connected_post_seq = 0;
+static uint32_t s_agent_trace_seq = 0;
+static volatile uint32_t s_mqtt_task_stack_hwm = 0;
+static volatile uint8_t s_mqtt_task_priority = 0;
+
+static uint32_t Entity_Mqtt_App_Current_Task_Stack_Hwm(void)
+{
+#if ENTITY_MQTT_HAVE_TASK_DIAG
+    return (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+#else
+    return 0U;
+#endif
+}
+
+static uint8_t Entity_Mqtt_App_Current_Task_Priority(void)
+{
+#if ENTITY_MQTT_HAVE_TASK_DIAG
+    return (uint8_t)uxTaskPriorityGet(NULL);
+#else
+    return 0U;
+#endif
+}
+
+static bool Entity_Mqtt_App_Buffer_Contains(const char *data, int len, const char *needle)
+{
+    size_t needle_len;
+
+    if (data == NULL || len <= 0 || needle == NULL)
+    {
+        return false;
+    }
+
+    needle_len = strlen(needle);
+    if (needle_len == 0U || (size_t)len < needle_len)
+    {
+        return false;
+    }
+
+    for (int i = 0; i <= len - (int)needle_len; ++i)
+    {
+        if (memcmp(data + i, needle, needle_len) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 static const char *Entity_Mqtt_App_State_Str(uint8_t state)
 {
@@ -135,8 +199,7 @@ static Mqtt_Client_Broker_Liveness_t Entity_Mqtt_App_Normalize_Broker_State(cons
 
 static bool Entity_Mqtt_App_Broker_Allows_Ai_Publish(Mqtt_Client_Broker_Liveness_t state)
 {
-    return (state == MQTT_BROKER_LIVENESS_READY) ||
-           (state == MQTT_BROKER_LIVENESS_PROBING);
+    return state == MQTT_BROKER_LIVENESS_READY;
 }
 
 static bool Entity_Mqtt_App_Broker_Healthy_For_Ai_Wait(Mqtt_Client_Broker_Liveness_t state)
@@ -149,6 +212,46 @@ static uint32_t Entity_Mqtt_App_Now_Ms(void)
     return Entity_Get_Run_Time_Ms();
 }
 
+static void Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot(const char *stage, const char *reason)
+{
+    Entity_Mqtt_Context_t *context = &Entity_Client_Instance;
+    Entity_Mqtt_App_Health_Snapshot_t health = {0};
+    char token_id[64] = {0};
+    uint64_t token_pub_ms = 0;
+    uint64_t now_ms = (uint64_t)Entity_Mqtt_App_Now_Ms();
+    bool token_pending = Entity_Mqtt_Get_Token_Pending_Snapshot(token_id, sizeof(token_id), &token_pub_ms);
+    uint64_t token_age_ms = (token_pending && now_ms >= token_pub_ms) ? (now_ms - token_pub_ms) : 0U;
+
+    (void)Entity_Mqtt_App_Get_Health_Snapshot(&health);
+    ENTITY_LOGW("[MQTT_DIAG][RECONNECT_APP_SNAPSHOT] stage=%s reason=%s "
+              "app_connected=%d ctx_connected=%d state=%s broker=%s "
+              "wait_ping=%d ping_age=%u ping_rtt=%u last_rx_age=%u last_inbound_age=%u "
+              "pending_qos1=%u oldest_msgid=%u oldest_age=%u agent_queue=%u "
+              "token_pending=%d token_id=%s token_age=%llu token_pub_ms=%llu "
+              "task_prio=%u task_stack_hwm=%u\r\n",
+              stage ? stage : "unknown",
+              reason ? reason : "unknown",
+              health.app_connected ? 1 : 0,
+              health.ctx_connected ? 1 : 0,
+              Entity_Mqtt_App_State_Str(context->State),
+              Entity_Mqtt_App_Broker_State_Name(health.broker_state),
+              health.wait_ping ? 1 : 0,
+              (unsigned int)health.pingreq_age_ms,
+              (unsigned int)health.last_pingresp_rtt_ms,
+              (unsigned int)health.last_rx_age_ms,
+              (unsigned int)health.broker_last_inbound_alive_age_ms,
+              (unsigned int)health.pending_qos1,
+              (unsigned int)health.oldest_qos1_msgid,
+              (unsigned int)health.oldest_qos1_age_ms,
+              (unsigned int)health.agent_queue_depth,
+              token_pending ? 1 : 0,
+              token_pending ? token_id : "(none)",
+              (unsigned long long)token_age_ms,
+              (unsigned long long)token_pub_ms,
+              (unsigned int)health.mqtt_task_priority,
+              (unsigned int)health.mqtt_task_stack_hwm);
+}
+
 static bool Entity_Mqtt_App_Topic_Equals(const char *rx_topic, const char *expected_topic)
 {
     if (rx_topic == NULL || expected_topic == NULL)
@@ -159,6 +262,88 @@ static bool Entity_Mqtt_App_Topic_Equals(const char *rx_topic, const char *expec
     size_t rx_len = strlen(rx_topic);
     size_t expected_len = strlen(expected_topic);
     return (rx_len == expected_len) && (memcmp(rx_topic, expected_topic, rx_len) == 0);
+}
+
+static void Entity_Mqtt_App_Drain_Agent_Queue(Entity_Mqtt_Context_t *entity_context)
+{
+    if (entity_context == NULL || !entity_context->Is_Connected || s_agent_queue == NULL)
+    {
+        return;
+    }
+
+    uint32_t queue_depth = (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue);
+    if (queue_depth > 0)
+    {
+        ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][AGENT_DRAIN_BEGIN] state=%s queue_depth=%u\r\n",
+                  Entity_Mqtt_App_State_Str(entity_context->State),
+                  (unsigned int)queue_depth);
+    }
+
+    Entity_Mqtt_Agent_Cmd_t cmd;
+    uint32_t msg_sz;
+    while (Entity_Msg_Queue_Wait(&s_agent_queue, &cmd, &msg_sz, 0) == 0)
+    {
+        if (cmd.type == AGENT_CMD_PUBLISH)
+        {
+            uint32_t dequeue_ms = Entity_Mqtt_App_Now_Ms();
+            if (cmd.ai_access)
+            {
+                ENTITY_LOGI("[MQTT_TRACE][T5_DEQUEUE] trace=%u dequeue_ms=%u queued_age_ms=%u "
+                            "topic_type=%d len=%d qos=%d retained=%d depth_left=%u "
+                            "task_prio=%u task_stack_hwm=%u\r\n",
+                            (unsigned int)cmd.trace_seq,
+                            (unsigned int)dequeue_ms,
+                            (unsigned int)(dequeue_ms - cmd.enqueue_ms),
+                            (int)cmd.topic_type,
+                            cmd.len,
+                            cmd.qos,
+                            cmd.retained,
+                            (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
+                            (unsigned int)s_mqtt_task_priority,
+                            (unsigned int)s_mqtt_task_stack_hwm);
+            }
+            ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][AGENT_PUB] topic_type=%d len=%d qos=%d "
+                      "retained=%d depth_left=%u\r\n",
+                      (int)cmd.topic_type,
+                      cmd.len,
+                      cmd.qos,
+                      cmd.retained,
+                      (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue));
+            uint32_t publish_begin_ms = Entity_Mqtt_App_Now_Ms();
+            int pub_ret = Entity_Mqtt_Topic_Publish(entity_context,
+                                                  cmd.topic_type,
+                                                  (const char *)cmd.data,
+                                                  cmd.len,
+                                                  cmd.qos,
+                                                  cmd.retained);
+            uint32_t publish_end_ms = Entity_Mqtt_App_Now_Ms();
+            if (cmd.ai_access)
+            {
+                ENTITY_LOGI("[MQTT_TRACE][T6_TOPIC_PUBLISH] trace=%u begin_ms=%u end_ms=%u cost_ms=%u "
+                            "ret=%d topic_type=%d len=%d qos=%d\r\n",
+                            (unsigned int)cmd.trace_seq,
+                            (unsigned int)publish_begin_ms,
+                            (unsigned int)publish_end_ms,
+                            (unsigned int)(publish_end_ms - publish_begin_ms),
+                            pub_ret,
+                            (int)cmd.topic_type,
+                            cmd.len,
+                            cmd.qos);
+            }
+            bool publish_ok = (pub_ret > 0) ||
+                              ((cmd.qos == QOS0_MOST_ONCE) && (pub_ret == 0));
+            if (!publish_ok)
+            {
+                ENTITY_LOGE("[AGENT] publish failed topic=%d ret=%d\r\n",
+                          (int)cmd.topic_type, pub_ret);
+            }
+            else
+            {
+                s_last_app_heartbeat_ms = Entity_Mqtt_App_Now_Ms();
+            }
+        }
+        Entity_Mem_Free(cmd.data);
+    }
 }
 
 static void Entity_Mqtt_Connected_Post_Process(Entity_Mqtt_Context_t *context)
@@ -559,14 +744,40 @@ void Entity_Mqtt_Client_Task(void *arg)
     while(1)
     {
         /* coreMQTT-Agent 主循環：
-         * 1. 執行 MQTT 狀態機（連線 / 訂閱 / ProcessLoop）
-         * 2. ProcessLoop 返回後處理 connected post work，再排空 Agent 指令隊列並執行真正的 Publish
-         *    （此時不在任何 callback 中，不會重入 MQTT_Publish）
-         * 3. 按需睡眠後繼續下一輪*/
+         * 1. 先排空 Agent 指令隊列，避免 request 已在 queue 中仍先進長時間 ProcessLoop。
+         * 2. 執行 MQTT 狀態機（連線 / 訂閱 / 短切片 ProcessLoop）。
+         * 3. ProcessLoop 返回後處理 connected post work，再排空本輪 callback/外部 task 新送入的指令。
+         *    兩個 drain 點都不在 MQTT callback 鏈中，不會重入 MQTT_Publish。
+         * 4. 按需睡眠後繼續下一輪。*/
+        s_mqtt_task_priority = Entity_Mqtt_App_Current_Task_Priority();
+        s_mqtt_task_stack_hwm = Entity_Mqtt_App_Current_Task_Stack_Hwm();
+        Entity_Mqtt_App_Drain_Agent_Queue(entity_context);
+        uint32_t loop_enter_ms = Entity_Mqtt_App_Now_Ms();
+        uint32_t loop_enter_depth = s_agent_queue ? (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0;
         int need_sleep_ms = Entity_Mqtt_Loop(entity_context);
+        uint32_t loop_exit_ms = Entity_Mqtt_App_Now_Ms();
+        uint32_t loop_cost_ms = loop_exit_ms - loop_enter_ms;
         bool should_exit = (entity_context->Prohibit_Connect && !entity_context->Is_Connected);
         Entity_Mqtt_Connected_Post_Process(entity_context);
         uint32_t queue_depth = s_agent_queue ? (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0;
+        s_mqtt_task_priority = Entity_Mqtt_App_Current_Task_Priority();
+        s_mqtt_task_stack_hwm = Entity_Mqtt_App_Current_Task_Stack_Hwm();
+        if ((loop_cost_ms >= 1000U) || (loop_enter_depth > 0U) || (queue_depth > 0U))
+        {
+            ENTITY_LOGI("[MQTT_TRACE][T4_LOOP] enter_ms=%u exit_ms=%u cost_ms=%u "
+                        "state=%s ctx_connected=%d app_connected=%d depth_enter=%u depth_exit=%u "
+                        "task_prio=%u task_stack_hwm=%u\r\n",
+                        (unsigned int)loop_enter_ms,
+                        (unsigned int)loop_exit_ms,
+                        (unsigned int)loop_cost_ms,
+                        Entity_Mqtt_App_State_Str(entity_context->State),
+                        entity_context->Is_Connected ? 1 : 0,
+                        s_mqtt_app_connected ? 1 : 0,
+                        (unsigned int)loop_enter_depth,
+                        (unsigned int)queue_depth,
+                        (unsigned int)s_mqtt_task_priority,
+                        (unsigned int)s_mqtt_task_stack_hwm);
+        }
 
         if (need_sleep_ms > 0)
         {
@@ -592,51 +803,7 @@ void Entity_Mqtt_Client_Task(void *arg)
             }
         }
 
-        /* ── 排空 Agent 指令隊列 ───────────────────────────────────────
-         * 只在已連線狀態下發布，斷線時保留的隊列項目將在下次連線後丟棄。
-         * Entity_Msg_Queue_Wait(timeout=0) 非阻塞，隊列空時立即返回非零。*/
-        if (entity_context->Is_Connected && s_agent_queue != NULL)
-        {
-            Entity_Mqtt_Agent_Cmd_t cmd;
-            if (queue_depth > 0)
-            {
-                ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][AGENT_DRAIN_BEGIN] state=%s queue_depth=%u\r\n",
-                          Entity_Mqtt_App_State_Str(entity_context->State),
-                          (unsigned int)queue_depth);
-            }
-            uint32_t msg_sz;
-            while (Entity_Msg_Queue_Wait(&s_agent_queue, &cmd, &msg_sz, 0) == 0)
-            {
-                if (cmd.type == AGENT_CMD_PUBLISH)
-                {
-                    ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][AGENT_PUB] topic_type=%d len=%d qos=%d "
-                              "retained=%d depth_left=%u\r\n",
-                              (int)cmd.topic_type,
-                              cmd.len,
-                              cmd.qos,
-                              cmd.retained,
-                              (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue));
-                    int pub_ret = Entity_Mqtt_Topic_Publish(entity_context,
-                                                          cmd.topic_type,
-                                                          (const char *)cmd.data,
-                                                          cmd.len,
-                                                          cmd.qos,
-                                                          cmd.retained);
-                    bool publish_ok = (pub_ret > 0) ||
-                                      ((cmd.qos == QOS0_MOST_ONCE) && (pub_ret == 0));
-                    if (!publish_ok)
-                    {
-                        ENTITY_LOGE("[AGENT] publish failed topic=%d ret=%d\r\n",
-                                  (int)cmd.topic_type, pub_ret);
-                    }
-                    else
-                    {
-                        s_last_app_heartbeat_ms = Entity_Mqtt_App_Now_Ms();
-                    }
-                }
-                Entity_Mem_Free(cmd.data);  /* 釋放 Entity_Mem_Malloc 副本 */
-            }
-        }
+        Entity_Mqtt_App_Drain_Agent_Queue(entity_context);
 
         if (entity_context->Is_Connected && s_agent_queue != NULL &&
             Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) == 0)
@@ -776,7 +943,7 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
      *
      * 呼叫方（Controller task、cloud_sync task、Connected callback 等）將
      * 指令 POST 到 s_agent_queue 後立即返回（timeout=0，永不阻塞呼叫方）。
-     * Agent Task 在每次 Entity_Mqtt_Loop() 返回後排空隊列並執行真正的 Publish。
+     * Agent Task 在 Entity_Mqtt_Loop() 前後的安全點排空隊列並執行真正的 Publish。
      *
      * 解決的問題：
      *   1. Connected callback 從 ProcessLoop 回調鏈觸發，若直接呼叫 Publish
@@ -825,6 +992,9 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
         .len        = len,
         .qos        = qos,
         .retained   = retained,
+        .trace_seq  = ++s_agent_trace_seq,
+        .enqueue_ms = Entity_Mqtt_App_Now_Ms(),
+        .ai_access  = Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_device_access"),
     };
 
     if (Entity_Msg_Queue_Send(&s_agent_queue, &cmd, sizeof(cmd), 0) != 0)
@@ -839,6 +1009,21 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
                   (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE);
         Entity_Mem_Free(data_copy);
         return OPRT_COM_ERROR;
+    }
+    if (cmd.ai_access)
+    {
+        ENTITY_LOGI("[MQTT_TRACE][T3_ENQUEUE] trace=%u enqueue_ms=%u topic_type=%d len=%d qos=%d "
+                    "retained=%d depth=%u/%u task_prio=%u task_stack_hwm=%u\r\n",
+                    (unsigned int)cmd.trace_seq,
+                    (unsigned int)cmd.enqueue_ms,
+                    (int)type_e,
+                    len,
+                    qos,
+                    retained,
+                    (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
+                    (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE,
+                    (unsigned int)Entity_Mqtt_App_Current_Task_Priority(),
+                    (unsigned int)Entity_Mqtt_App_Current_Task_Stack_Hwm());
     }
     ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][PUB_ENQUEUE] topic=%d len=%d qos=%d retained=%d "
               "depth=%u/%u\r\n",
@@ -908,16 +1093,17 @@ bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
         return true;
     }
 
-    bool force_reconnect = stale_puback ||
-                           (broker.state == MQTT_BROKER_LIVENESS_DEAD) ||
-                           (broker.state == MQTT_BROKER_LIVENESS_DISCONNECTED);
-    ENTITY_LOGW("[MQTT_DIAG][AI_PUBLISH_NOT_READY] broker_ok=%d broker=%s force_reconnect=%d "
+    bool request_reconnect = stale_puback ||
+                             (broker.state == MQTT_BROKER_LIVENESS_PROBING) ||
+                             (broker.state == MQTT_BROKER_LIVENESS_DEAD) ||
+                             (broker.state == MQTT_BROKER_LIVENESS_DISCONNECTED);
+    ENTITY_LOGW("[MQTT_DIAG][AI_PUBLISH_NOT_READY] broker_ok=%d broker=%s request_reconnect=%d "
               "stale_puback=%d keepalive=%u pingresp_timeout=%u last_inbound_age=%u "
               "wait_ping=%d pingreq_age=%u pingresp_rtt=%u last_rx_age=%u "
               "pending_qos1=%u oldest_msgid=%u oldest_age=%u stale_puback_ms=%u\r\n",
               broker_ok ? 1 : 0,
               Mqtt_Client_Broker_Liveness_Str(broker.state),
-              force_reconnect ? 1 : 0,
+              request_reconnect ? 1 : 0,
               stale_puback ? 1 : 0,
               (unsigned int)broker.keepalive_ms,
               (unsigned int)broker.pingresp_timeout_ms,
@@ -931,11 +1117,17 @@ bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
               (unsigned int)oldest_age_ms,
               (unsigned int)ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
 
-    if (force_reconnect)
+    if (request_reconnect)
     {
+        Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot("ai_publish_not_ready",
+                                        stale_puback ? "ai_publish_pending_qos1" :
+                                        (broker.state == MQTT_BROKER_LIVENESS_PROBING) ? "ai_publish_broker_probing" :
+                                        (broker.state == MQTT_BROKER_LIVENESS_DEAD) ? "ai_publish_broker_dead" :
+                                        "ai_publish_broker_disconnected");
         s_mqtt_app_connected = false;
         (void)Entity_Mqtt_Force_Reconnect(context,
                                         stale_puback ? "ai_publish_pending_qos1" :
+                                        (broker.state == MQTT_BROKER_LIVENESS_PROBING) ? "ai_publish_broker_probing" :
                                         (broker.state == MQTT_BROKER_LIVENESS_DEAD) ? "ai_publish_broker_dead" :
                                         "ai_publish_broker_disconnected");
     }
@@ -1046,6 +1238,14 @@ bool Entity_Mqtt_App_Get_Health_Snapshot(Entity_Mqtt_App_Health_Snapshot_t *snap
         snapshot->mqtt_callback_max_ms = broker.callback_max_ms;
         snapshot->mqtt_callback_slow_count = broker.callback_slow_count;
     }
+    if (s_mqtt_task_stack_hwm != 0U)
+    {
+        snapshot->mqtt_task_stack_hwm = s_mqtt_task_stack_hwm;
+    }
+    if (s_mqtt_task_priority != 0U)
+    {
+        snapshot->mqtt_task_priority = s_mqtt_task_priority;
+    }
     return true;
 }
 
@@ -1057,6 +1257,7 @@ void Entity_Mqtt_App_Reset_Keepalive(void)
 
 bool Entity_Mqtt_App_Force_Reconnect(const char *reason)
 {
+    Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot("force_reconnect", reason);
     s_mqtt_app_connected = false;
     return Entity_Mqtt_Force_Reconnect(&Entity_Client_Instance, reason) == OPRT_OK;
 }

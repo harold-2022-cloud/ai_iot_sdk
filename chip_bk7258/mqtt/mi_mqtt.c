@@ -4,6 +4,7 @@
 #include "mi_mqtt_state.h"
 
 #include "mi_mqtt_port_bk.h"  // BK7258 platform seam: replaces rino_hal.h
+#include "entity_log.h"
 
 #include <string.h>
 #include <assert.h>
@@ -153,6 +154,7 @@ static int32_t sendPacket( MQTTContext_t * pContext,
 
     /* Record the time of transmission. */
     sendTime = pContext->getTime();
+    uint32_t trace_start_ms = sendTime;
 
     /* Loop until the entire packet is sent. */
     while( ( bytesRemaining > 0UL ) && ( sendError == false ) )
@@ -192,6 +194,18 @@ static int32_t sendPacket( MQTTContext_t * pContext,
         // pContext->lastPacketTime = sendTime;
         LogDebug( ( "Successfully sent packet at time %u.",
                     sendTime ) );
+    }
+    {
+        uint32_t trace_end_ms = pContext->getTime();
+        if ((bytesToSend >= 64U) || (trace_end_ms - trace_start_ms >= 20U) || (totalBytesSent < 0))
+        {
+            ENTITY_LOGI("[MQTT_TRACE][T8_TRANSPORT_SEND] begin_ms=%u end_ms=%u cost_ms=%u requested=%u sent=%d\r\n",
+                        (unsigned int)trace_start_ms,
+                        (unsigned int)trace_end_ms,
+                        (unsigned int)(trace_end_ms - trace_start_ms),
+                        (unsigned int)bytesToSend,
+                        (int)totalBytesSent);
+        }
     }
     sendTime = sendTime;
     return totalBytesSent;
@@ -582,23 +596,31 @@ static MQTTStatus_t handleKeepAlive( MQTTContext_t * pContext )
     now = pContext->getTime();
     keepAliveMs = 1000U * ( uint32_t ) pContext->keepAliveIntervalSec;
 
-    /* If keep alive interval is 0, it is disabled. */
-    if( ( keepAliveMs != 0U ) &&
-        ( calculateElapsedTime( now, pContext->lastPacketTime ) > keepAliveMs ) )
+    if( keepAliveMs == 0U )
     {
-        pContext->lastPacketTime = now;
-        status = MQTT_Ping( pContext );
+        return status;
     }
 
-    if( (status == MQTTSuccess) && (pContext->waitingForPingResp == true) )
+    if( pContext->waitingForPingResp == true )
     {
-        /* Has time expired? */
         if( calculateElapsedTime( now, pContext->pingReqSendTimeMs ) >
             MQTT_PINGRESP_TIMEOUT_MS )
         {
-            LogInfo( ("MQTTKeepAliveTimeout: %d ms", now - pContext->pingReqSendTimeMs) );
+            ENTITY_LOGW("[MQTT_KEEPALIVE][PINGRESP_TIMEOUT] age_ms=%u timeout_ms=%u "
+                        "last_packet=%u ping_sent=%u\r\n",
+                        (unsigned int)(now - pContext->pingReqSendTimeMs),
+                        (unsigned int)MQTT_PINGRESP_TIMEOUT_MS,
+                        (unsigned int)pContext->lastPacketTime,
+                        (unsigned int)pContext->pingReqSendTimeMs);
             status = MQTTKeepAliveTimeout;
         }
+        return status;
+    }
+
+    if( calculateElapsedTime( now, pContext->lastPacketTime ) > keepAliveMs )
+    {
+        pContext->lastPacketTime = now;
+        status = MQTT_Ping( pContext );
     }
 
     return status;
@@ -851,8 +873,13 @@ static MQTTStatus_t handleIncomingAck( MQTTContext_t * pContext,
 
             if( ( status == MQTTSuccess ) && ( manageKeepAlive == true ) )
             {
-                pContext->ping_rtt_ms = pContext->getTime() - pContext->pingReqSendTimeMs;
-                LogDebug(("mqtt ping rtt: %d ms", pContext->ping_rtt_ms));
+                uint32_t now_ms = pContext->getTime();
+                pContext->pingRespRecvTimeMs = now_ms;
+                pContext->ping_rtt_ms = now_ms - pContext->pingReqSendTimeMs;
+                ENTITY_LOGI("[MQTT_KEEPALIVE][PINGRESP_RX] rtt_ms=%u ping_sent=%u now=%u\r\n",
+                            (unsigned int)pContext->ping_rtt_ms,
+                            (unsigned int)pContext->pingReqSendTimeMs,
+                            (unsigned int)now_ms);
                 
                 pContext->waitingForPingResp = false;
             }
@@ -1864,8 +1891,10 @@ MQTTStatus_t MQTT_Ping( MQTTContext_t * pContext )
         {
             pContext->pingReqSendTimeMs = pContext->lastPacketTime;
             pContext->waitingForPingResp = true;
-            LogDebug( ( "Sent %d bytes of PINGREQ packet.",
-                        bytesSent ) );
+            ENTITY_LOGI("[MQTT_KEEPALIVE][PINGREQ_SEND] bytes=%d packet_size=%u sent_ms=%u\r\n",
+                        bytesSent,
+                        (unsigned int)packetSize,
+                        (unsigned int)pContext->pingReqSendTimeMs);
         }
     }
     hal_mutex_unlock(&pContext->mutex); 
@@ -2368,4 +2397,3 @@ const char * MQTT_Status_strerror( MQTTStatus_t status )
 
     return str;
 }
-

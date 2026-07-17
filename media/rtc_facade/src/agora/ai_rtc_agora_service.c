@@ -148,7 +148,7 @@ static bool service_has_text(const char *value)
     return value != NULL && value[0] != '\0';
 }
 
-static bool service_should_log_not_ready(uint32_t *counter)
+static bool service_should_log_counter(uint32_t *counter)
 {
     uint32_t value;
 
@@ -176,12 +176,14 @@ static bool service_accept_callback(connection_id_t conn_id)
     {
         return true;
     }
-    s_agora.stale_callbacks++;
-    AI_RTC_AGORA_LOG("callback stale conn=%d current=%d active=%d stale=%lu",
-                     (int)conn_id,
-                     (int)s_agora.conn_id,
-                     s_agora.session_active ? 1 : 0,
-                     (unsigned long)s_agora.stale_callbacks);
+    if (service_should_log_counter(&s_agora.stale_callbacks))
+    {
+        AI_RTC_AGORA_LOG("callback stale conn=%d current=%d active=%d stale=%lu",
+                         (int)conn_id,
+                         (int)s_agora.conn_id,
+                         s_agora.session_active ? 1 : 0,
+                         (unsigned long)s_agora.stale_callbacks);
+    }
     return false;
 }
 
@@ -760,7 +762,7 @@ int Ai_Rtc_Agora_Service_Send_Audio(const Ai_Rtc_Facade_Audio_Frame_t *frame)
     }
     if (!active || !joined || !remote_user_joined || conn_id == CONNECTION_ID_INVALID)
     {
-        if (service_should_log_not_ready(&s_agora.audio_not_ready_logs))
+        if (service_should_log_counter(&s_agora.audio_not_ready_logs))
         {
             AI_RTC_AGORA_LOG("send_audio not_ready active=%d joined=%d remote_user_joined=%d conn=%d gen=%lu",
                              active ? 1 : 0,
@@ -816,7 +818,7 @@ int Ai_Rtc_Agora_Service_Send_Datastream(const uint8_t *data, size_t len)
 
     if (!active || !joined || !control_ready || conn_id == CONNECTION_ID_INVALID || data == NULL || len == 0u)
     {
-        if (service_should_log_not_ready(&s_agora.datastream_not_ready_logs))
+        if (service_should_log_counter(&s_agora.datastream_not_ready_logs))
         {
             AI_RTC_AGORA_LOG("send_datastream not_ready joined=%d control_ready=%d data=%d len=%lu conn=%d gen=%lu",
                              joined ? 1 : 0,

@@ -16,8 +16,39 @@
 
 #include "bsp_system.h"       // Bsp_Mem_*, Bsp_Mutex_*, Bsp_Get_Run_Time_Ms
 #include "bsp_network.h"      // Network_Tcp/Tls_*, Transport_Interface_t, Network_Context_t
+#include "entity_log.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include <string.h>
+#include <stdbool.h>
+
+#define ENTITY_MQTT_PROCESS_LOOP_SLICE_MS 200U
+
+static bool Mi_Mqtt_Client_Buffer_Contains(const uint8_t *data, size_t len, const char *needle)
+{
+    size_t needle_len;
+
+    if (data == NULL || len == 0U || needle == NULL)
+    {
+        return false;
+    }
+
+    needle_len = strlen(needle);
+    if (needle_len == 0U || len < needle_len)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i <= len - needle_len; ++i)
+    {
+        if (memcmp(data + i, needle, needle_len) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 #define MQTT_SEND_DISCONNECT_PACKET 1
 
@@ -33,6 +64,7 @@ struct Mqtt_Client_Context
     uint8_t              Rxbuf[MQTT_RX_BUFFER_SIZE];
     uint8_t              Txbuf[MQTT_TX_BUFFER_SIZE];
     uint32_t             Last_Rx_Ms;              // 最近一次入站包时间戳（诊断用，0 = 尚未收到）
+    uint32_t             Last_Alive_Ms;           // 最近一次 broker 活性包时间戳（PUBLISH/PINGRESP）
 };
 
 typedef struct Mqtt_Client_Context Mqtt_Client_Context_t;
@@ -61,6 +93,7 @@ static void Mi_Mqtt_Event_User_Callback( struct MQTTContext* pContext,
 
     // 记录最近入站包时间戳（供 Mqtt_Client_Last_Rx_Age_Ms 计算 age）
     context->Last_Rx_Ms = Bsp_Get_Run_Time_Ms();
+    context->Last_Alive_Ms = context->Last_Rx_Ms;
 
     uint16_t msgid = pDeserializedInfo->packetIdentifier;
 
@@ -148,6 +181,31 @@ void Mqtt_Client_Free(void* client_context)
     {
         Bsp_Mem_Free(client_context);
     }
+}
+
+static void Mqtt_Client_Reset_Runtime_State(Mqtt_Client_Context_t* context, const char *reason)
+{
+    if (context == NULL)
+    {
+        return;
+    }
+
+    uint32_t now_ms = Bsp_Get_Run_Time_Ms();
+    Bsp_Mutex_Lock(&context->Mqtt_Context.mutex, 0xFFFFFFFF);
+    context->Mqtt_Context.connectStatus = MQTTNotConnected;
+    context->Mqtt_Context.waitingForPingResp = false;
+    context->Mqtt_Context.pingReqSendTimeMs = 0U;
+    context->Mqtt_Context.pingRespRecvTimeMs = 0U;
+    context->Mqtt_Context.ping_rtt_ms = 0U;
+    context->Mqtt_Context.lastPacketTime = now_ms;
+    context->Mqtt_Context.controlPacketSent = false;
+    Bsp_Mutex_Unlock(&context->Mqtt_Context.mutex);
+    context->Last_Rx_Ms = 0U;
+    context->Last_Alive_Ms = 0U;
+
+    ENTITY_LOGW("[MQTT_DIAG][SESSION_RESET] reason=%s now=%u\r\n",
+                reason ? reason : "unknown",
+                (unsigned int)now_ms);
 }
 
 /**
@@ -255,6 +313,8 @@ Mqtt_Client_Status_t Mqtt_Client_Connect(void* client_context)
     Mqtt_Client_Context_t* context = (Mqtt_Client_Context_t*)client_context;
     MQTTStatus_t mqtt_status;
 
+    Mqtt_Client_Reset_Runtime_State(context, "before_connect");
+
     // 1、建立网络连接 host port
     int ret = context->Network.Connect(&context->Network, &context->Config.Tcp_Connect_Params, NULL);
     if (0 != ret)
@@ -323,6 +383,7 @@ Mqtt_Client_Status_t Mqtt_Client_Disconnect(void* client_context)
 #endif
     // 2、再断网络连接
     context->Network.Disconnect(&context->Network);
+    Mqtt_Client_Reset_Runtime_State(context, "after_disconnect");
     if(context->Config.On_Disconnected)
     {
         context->Config.On_Disconnected(context, context->Config.Userdata);
@@ -402,6 +463,8 @@ int Mqtt_Client_Publish(void* client_context, const char* topic, const uint8_t* 
 {
     Mqtt_Client_Context_t* context = (Mqtt_Client_Context_t*)client_context;
     MQTTStatus_t mqtt_status;
+    bool ai_access = Mi_Mqtt_Client_Buffer_Contains(payload, length, "agora_agent_device_access");
+    uint32_t begin_ms = Bsp_Get_Run_Time_Ms();
     Bsp_Mutex_Lock(&context->Mqtt_Context.mutex, 0xFFFFFFFF);
 
     uint16_t msgid = MQTT_GetPacketId( &context->Mqtt_Context );
@@ -412,11 +475,36 @@ int Mqtt_Client_Publish(void* client_context, const char* topic, const uint8_t* 
         .pPayload        = payload,
         .payloadLength   = length,
     };
+    if (ai_access)
+    {
+        ENTITY_LOGI("[MQTT_TRACE][T7_CORE_PUBLISH_BEGIN] mono_ms=%u topic=%s len=%u qos=%u msgid=%u "
+                    "task_prio=%u task_stack_hwm=%u\r\n",
+                    (unsigned int)begin_ms,
+                    topic ? topic : "(null)",
+                    (unsigned int)length,
+                    (unsigned int)qos,
+                    (unsigned int)msgid,
+                    (unsigned int)uxTaskPriorityGet(NULL),
+                    (unsigned int)uxTaskGetStackHighWaterMark(NULL));
+    }
     mqtt_status = MQTT_Publish( &context->Mqtt_Context,
-                                &pub_info,
-                                msgid);
+	                                &pub_info,
+	                                msgid);
 
     Bsp_Mutex_Unlock(&context->Mqtt_Context.mutex);
+    if (ai_access)
+    {
+        uint32_t end_ms = Bsp_Get_Run_Time_Ms();
+        ENTITY_LOGI("[MQTT_TRACE][T7_CORE_PUBLISH_END] begin_ms=%u end_ms=%u cost_ms=%u "
+                    "status=%d msgid=%u len=%u qos=%u\r\n",
+                    (unsigned int)begin_ms,
+                    (unsigned int)end_ms,
+                    (unsigned int)(end_ms - begin_ms),
+                    (int)mqtt_status,
+                    (unsigned int)msgid,
+                    (unsigned int)length,
+                    (unsigned int)qos);
+    }
 
     if (MQTTSuccess != mqtt_status)
     {
@@ -436,13 +524,69 @@ Mqtt_Client_Status_t Mqtt_Client_Yield(void* client_context)
 {
     Mqtt_Client_Context_t* context = (Mqtt_Client_Context_t*)client_context;
     MQTTStatus_t mqtt_status;
+    static uint32_t s_last_probing_diag_ms = 0U;
+    uint32_t process_loop_timeout_ms = context->Config.Tcp_Connect_Params.Timeout_Ms;
+    uint32_t now_ms = context->Mqtt_Context.getTime ? context->Mqtt_Context.getTime() : 0U;
+    if (process_loop_timeout_ms > ENTITY_MQTT_PROCESS_LOOP_SLICE_MS)
+    {
+        process_loop_timeout_ms = ENTITY_MQTT_PROCESS_LOOP_SLICE_MS;
+    }
     // 循环从传输接口接收数据包, 并处理保活
-    mqtt_status = MQTT_ProcessLoop( &context->Mqtt_Context, context->Config.Tcp_Connect_Params.Timeout_Ms);
+    mqtt_status = MQTT_ProcessLoop( &context->Mqtt_Context, process_loop_timeout_ms);
+    if (context->Mqtt_Context.pingRespRecvTimeMs != 0U &&
+        context->Mqtt_Context.pingRespRecvTimeMs != context->Last_Alive_Ms)
+    {
+        context->Last_Alive_Ms = context->Mqtt_Context.pingRespRecvTimeMs;
+    }
     if( mqtt_status != MQTTSuccess )
     {
-        LogError( ("MQTT_ProcessLoop returned with status = %s.", MQTT_Status_strerror( mqtt_status )) );
+        uint32_t ping_age_ms = 0U;
+        now_ms = context->Mqtt_Context.getTime ? context->Mqtt_Context.getTime() : now_ms;
+        if (context->Mqtt_Context.waitingForPingResp &&
+            now_ms >= context->Mqtt_Context.pingReqSendTimeMs)
+        {
+            ping_age_ms = now_ms - context->Mqtt_Context.pingReqSendTimeMs;
+        }
+        ENTITY_LOGW("[MQTT_LOOP_DIAG][PROCESS_LOOP_STATUS] return_status=%s(%d) "
+                    "mapped_status=%d slice_ms=%u wait_ping=%d ping_age=%u "
+                    "ping_sent=%u last_packet=%u ping_rtt=%u last_rx=%u connected=%d\r\n",
+                    MQTT_Status_strerror( mqtt_status ),
+                    mqtt_status,
+                    MQTT_STATUS_NETWORK_TIMEOUT,
+                    (unsigned int)process_loop_timeout_ms,
+                    context->Mqtt_Context.waitingForPingResp ? 1 : 0,
+                    (unsigned int)ping_age_ms,
+                    (unsigned int)context->Mqtt_Context.pingReqSendTimeMs,
+                    (unsigned int)context->Mqtt_Context.lastPacketTime,
+                    (unsigned int)context->Mqtt_Context.ping_rtt_ms,
+                    (unsigned int)context->Last_Rx_Ms,
+                    context->Mqtt_Context.connectStatus == MQTTConnected ? 1 : 0);
+        (void)ping_age_ms;
         Mqtt_Client_Disconnect(context);
         return MQTT_STATUS_NETWORK_TIMEOUT;
+    }
+    if (context->Mqtt_Context.waitingForPingResp)
+    {
+        now_ms = context->Mqtt_Context.getTime ? context->Mqtt_Context.getTime() : now_ms;
+        if ((s_last_probing_diag_ms == 0U) ||
+            (now_ms - s_last_probing_diag_ms >= 5000U))
+        {
+            uint32_t ping_age_ms = (now_ms >= context->Mqtt_Context.pingReqSendTimeMs) ?
+                                   (now_ms - context->Mqtt_Context.pingReqSendTimeMs) : 0U;
+            s_last_probing_diag_ms = now_ms;
+            LogInfo( ("[MQTT_LOOP_DIAG][PROBING] slice_ms=%u wait_ping=1 ping_age=%u "
+                      "ping_sent=%u last_packet=%u ping_rtt=%u",
+                      (unsigned int)process_loop_timeout_ms,
+                      (unsigned int)ping_age_ms,
+                      (unsigned int)context->Mqtt_Context.pingReqSendTimeMs,
+                      (unsigned int)context->Mqtt_Context.lastPacketTime,
+                      (unsigned int)context->Mqtt_Context.ping_rtt_ms) );
+            (void)ping_age_ms;
+        }
+    }
+    else
+    {
+        s_last_probing_diag_ms = 0U;
     }
     return MQTT_STATUS_SUCCESS;
 }
@@ -536,7 +680,7 @@ const char* Mqtt_Client_Broker_Liveness_Str(Mqtt_Client_Broker_Liveness_t state)
 *@名称        Mqtt_Client_Broker_Liveness_Snapshot
 *@功能        broker liveness 快照
 *@返回值      bool（ctx/snapshot 均非空才 true）
-*@说明        BK conservative（spec §6）：清零快照，state 由引擎连接状态保守推导
+*@说明        BK: derive liveness from core MQTT keepalive/PINGRESP state.
 */
 bool Mqtt_Client_Broker_Liveness_Snapshot(void* client_context, Mqtt_Client_Broker_Liveness_Snapshot_t* snapshot)
 {
@@ -545,11 +689,51 @@ bool Mqtt_Client_Broker_Liveness_Snapshot(void* client_context, Mqtt_Client_Brok
         return false;
     }
     Mqtt_Client_Context_t* context = (Mqtt_Client_Context_t*)client_context;
+    uint32_t now_ms = Bsp_Get_Run_Time_Ms();
+    uint32_t keepalive_ms = (uint32_t)context->Config.Keepalive * 1000U;
+    uint32_t pingreq_age_ms = 0U;
+    uint32_t last_inbound_alive_age_ms = UINT32_MAX;
+
     memset(snapshot, 0, sizeof(*snapshot));
-    // 由引擎连接状态保守推导 state；其余字段保持清零（BK 不提供 ESP 时代诊断细节）。
-    snapshot->state = (context->Mqtt_Context.connectStatus == MQTTConnected)
-                          ? MQTT_BROKER_LIVENESS_READY
-                          : MQTT_BROKER_LIVENESS_DISCONNECTED;
+    snapshot->keepalive_ms = keepalive_ms;
+    snapshot->pingresp_timeout_ms = MQTT_PINGRESP_TIMEOUT_MS;
+    snapshot->wait_ping = context->Mqtt_Context.waitingForPingResp;
+    snapshot->last_pingresp_rtt_ms = context->Mqtt_Context.ping_rtt_ms;
+
+    if (context->Last_Alive_Ms != 0U)
+    {
+        last_inbound_alive_age_ms = (now_ms >= context->Last_Alive_Ms) ?
+                                    (now_ms - context->Last_Alive_Ms) : 0U;
+    }
+    snapshot->last_inbound_alive_age_ms = last_inbound_alive_age_ms;
+
+    if (context->Mqtt_Context.waitingForPingResp)
+    {
+        pingreq_age_ms = (now_ms >= context->Mqtt_Context.pingReqSendTimeMs) ?
+                         (now_ms - context->Mqtt_Context.pingReqSendTimeMs) : 0U;
+    }
+    snapshot->pingreq_age_ms = pingreq_age_ms;
+
+    if (context->Mqtt_Context.connectStatus != MQTTConnected)
+    {
+        snapshot->state = MQTT_BROKER_LIVENESS_DISCONNECTED;
+    }
+    else if (context->Mqtt_Context.waitingForPingResp)
+    {
+        snapshot->state = (pingreq_age_ms > MQTT_PINGRESP_TIMEOUT_MS) ?
+                          MQTT_BROKER_LIVENESS_DEAD :
+                          MQTT_BROKER_LIVENESS_PROBING;
+    }
+    else if ((keepalive_ms != 0U) &&
+             (last_inbound_alive_age_ms != UINT32_MAX) &&
+             (last_inbound_alive_age_ms > (keepalive_ms + MQTT_PINGRESP_TIMEOUT_MS)))
+    {
+        snapshot->state = MQTT_BROKER_LIVENESS_DEAD;
+    }
+    else
+    {
+        snapshot->state = MQTT_BROKER_LIVENESS_READY;
+    }
     return true;
 }
 

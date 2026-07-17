@@ -23,6 +23,31 @@
         }                                 \
     } while (0)
 
+static bool Entity_Mqtt_Client_Buffer_Contains(const char *data, int len, const char *needle)
+{
+    size_t needle_len;
+
+    if (data == NULL || len <= 0 || needle == NULL)
+    {
+        return false;
+    }
+
+    needle_len = strlen(needle);
+    if (needle_len == 0U || (size_t)len < needle_len)
+    {
+        return false;
+    }
+
+    for (int i = 0; i <= len - (int)needle_len; ++i)
+    {
+        if (memcmp(data + i, needle, needle_len) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *Mqtt_Status_Str(int status)
 {
     switch (status)
@@ -62,6 +87,65 @@ ENTITY_PSRAM_BSS static char Cmd_Subscribe_Topic[ENTITY_MQTT_TOPIC_MAX_LEN];//�
 static uint32_t s_reconnect_delay_ms = 1000;
 static uint32_t s_sub_enter_ms = 0;
 static uint32_t s_loop_connect_attempt = 0;
+
+static void Entity_Mqtt_Set_Reconnect_Reason(Entity_Mqtt_Context_t *context, const char *reason)
+{
+	if (context == NULL) {
+		return;
+	}
+	const char *safe_reason = (reason != NULL) ? reason : "unknown";
+	snprintf(context->Reconnect_Reason, sizeof(context->Reconnect_Reason), "%s", safe_reason);
+}
+
+static void Entity_Mqtt_Log_Reconnect_Core_Snapshot(Entity_Mqtt_Context_t *context,
+                                                    const char *stage,
+                                                    const char *reason)
+{
+    uint32_t last_rx_age_ms = 0U;
+    uint32_t pending_qos1 = 0U;
+    uint32_t oldest_qos1_age_ms = 0U;
+    uint16_t oldest_qos1_msgid = 0U;
+    Mqtt_Client_Broker_Liveness_Snapshot_t broker = {0};
+    bool broker_ok = false;
+
+    if (context == NULL || context->Mqtt_Client == NULL)
+    {
+        ENTITY_LOGW("[MQTT_DIAG][RECONNECT_REASON_SNAPSHOT] stage=%s reason=%s context_ready=0\r\n",
+                  stage ? stage : "unknown",
+                  reason ? reason : "unknown");
+        return;
+    }
+
+    last_rx_age_ms = Mqtt_Client_Last_Rx_Age_Ms(context->Mqtt_Client);
+    (void)Mqtt_Client_Pending_Qos1_Snapshot(context->Mqtt_Client,
+                                            &pending_qos1,
+                                            &oldest_qos1_age_ms,
+                                            &oldest_qos1_msgid);
+    broker_ok = Mqtt_Client_Broker_Liveness_Snapshot(context->Mqtt_Client, &broker);
+
+    ENTITY_LOGW("[MQTT_DIAG][RECONNECT_REASON_SNAPSHOT] stage=%s reason=%s "
+              "state=%s ctx_connected=%d broker_ok=%d broker=%s keepalive=%u pingresp_timeout=%u "
+              "wait_ping=%d ping_age=%u ping_rtt=%u last_inbound_age=%u last_rx_age=%u "
+              "pending_qos1=%u oldest_msgid=%u oldest_age=%u reconnect_pending=%d prohibit=%d\r\n",
+              stage ? stage : "unknown",
+              reason ? reason : "unknown",
+              Entity_Mqtt_State_Str(context->State),
+              context->Is_Connected ? 1 : 0,
+              broker_ok ? 1 : 0,
+              Mqtt_Client_Broker_Liveness_Str(broker.state),
+              (unsigned int)broker.keepalive_ms,
+              (unsigned int)broker.pingresp_timeout_ms,
+              broker.wait_ping ? 1 : 0,
+              (unsigned int)broker.pingreq_age_ms,
+              (unsigned int)broker.last_pingresp_rtt_ms,
+              (unsigned int)broker.last_inbound_alive_age_ms,
+              (unsigned int)last_rx_age_ms,
+              (unsigned int)pending_qos1,
+              (unsigned int)oldest_qos1_msgid,
+              (unsigned int)oldest_qos1_age_ms,
+              context->Reconnect_Pending ? 1 : 0,
+              context->Prohibit_Connect ? 1 : 0);
+}
 
 /**
 *@名称 		Entity_Mqtt_Topic_Init
@@ -251,6 +335,12 @@ static void Mqtt_Client_Message_Callback(void* client_context, uint16_t msgid, c
 	entity_msg.Qos = msg->Qos;
 	entity_msg.Payload = (const char*)msg->Payload;
 	entity_msg.Len = msg->Length;
+    ENTITY_LOGI("[MQTT_TRACE][T9_RX_CALLBACK] mono_ms=%u msgid=%u qos=%d topic=%s len=%u\r\n",
+                (unsigned int)Entity_Get_Run_Time_Ms(),
+                (unsigned int)msgid,
+                msg->Qos,
+                msg->Topic ? msg->Topic : "(null)",
+                (unsigned int)msg->Length);
 	if (context->Config.Recv_Messages_Cb) {
 		context->Config.Recv_Messages_Cb(context, context->User_Data, &entity_msg);
 	}
@@ -426,23 +516,16 @@ int Entity_Mqtt_Force_Reconnect(Entity_Mqtt_Context_t* context, const char *reas
 	}
 
 	const char *safe_reason = (reason != NULL) ? reason : "unknown";
-	uint8_t prev_state = context->State;
-	ENTITY_LOGW("[MQTT_DIAG][FORCE_RECONNECT] reason=%s state=%s is_connected=%d last_id=%u prohibit=%d\r\n",
+    Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "request", safe_reason);
+	Entity_Mqtt_Set_Reconnect_Reason(context, safe_reason);
+	context->Reconnect_Pending = true;
+	context->Prohibit_Connect = false;
+	ENTITY_LOGW("[MQTT_DIAG][RECONNECT_PENDING] reason=%s state=%s is_connected=%d last_id=%u prohibit=%d\r\n",
 	          safe_reason,
 	          Entity_Mqtt_State_Str(context->State),
 	          context->Is_Connected ? 1 : 0,
 	          (unsigned int)context->Last_Subscribe_Id,
 	          context->Prohibit_Connect ? 1 : 0);
-	context->Prohibit_Connect = false;
-	context->Is_Connected = false;
-	context->Last_Subscribe_Id = 0;
-	Mqtt_Client_Status_t mqtt_status = Mqtt_Client_Disconnect(context->Mqtt_Client);
-	context->State = ENTITY_MQTT_CONNCET_STATE;
-	ENTITY_LOGW("[MQTT_DIAG][STATE] %s -> %s by FORCE_RECONNECT status=%d(%s)\r\n",
-	          Entity_Mqtt_State_Str(prev_state),
-	          Entity_Mqtt_State_Str(context->State),
-	          (int)mqtt_status,
-	          Mqtt_Status_Str((int)mqtt_status));
 	return OPRT_OK;
 }
 
@@ -459,6 +542,42 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 		return OPRT_INVALID_PARM;
 	}
 	int ret = OPRT_OK;
+	if (context->Reconnect_Pending)
+	{
+		uint8_t prev_state = context->State;
+		uint16_t prev_last_id = context->Last_Subscribe_Id;
+		bool should_disconnect = context->Is_Connected ||
+		                         (prev_state == ENTITY_MQTT_SUBSCRIBING_STATE) ||
+		                         (prev_state == ENTITY_MQTT_SUBSCRIBE_COMPLETE_STATE) ||
+		                         (prev_state == ENTITY_MQTT_YIELD_STATE);
+		const char *reason = context->Reconnect_Reason[0] ?
+		                     context->Reconnect_Reason : "unknown";
+        Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "begin", reason);
+		context->Reconnect_Pending = false;
+		context->Prohibit_Connect = false;
+		context->Is_Connected = false;
+		context->Last_Subscribe_Id = 0;
+		s_sub_enter_ms = 0;
+		ENTITY_LOGW("[MQTT_DIAG][RECONNECT_BEGIN] reason=%s state=%s last_id=%u prohibit=%d "
+		          "disconnect=%d\r\n",
+		          reason,
+		          Entity_Mqtt_State_Str(prev_state),
+		          (unsigned int)prev_last_id,
+		          context->Prohibit_Connect ? 1 : 0,
+		          should_disconnect ? 1 : 0);
+		Mqtt_Client_Status_t mqtt_status = MQTT_STATUS_SUCCESS;
+		if (should_disconnect)
+		{
+			mqtt_status = Mqtt_Client_Disconnect(context->Mqtt_Client);
+		}
+		context->State = ENTITY_MQTT_CONNCET_STATE;
+		ENTITY_LOGW("[MQTT_DIAG][STATE] %s -> %s by RECONNECT_PENDING status=%d(%s)\r\n",
+		          Entity_Mqtt_State_Str(prev_state),
+		          Entity_Mqtt_State_Str(context->State),
+		          (int)mqtt_status,
+		          Mqtt_Status_Str((int)mqtt_status));
+		return 0;
+	}
 	switch (context->State) 
 	{
 		case ENTITY_MQTT_IDLE_STATE:		//空闲状态
@@ -712,6 +831,8 @@ int Entity_Mqtt_Topic_Publish(Entity_Mqtt_Context_t* context, Topic_Type_e type_
 {
 
     int rc = 0;
+    uint32_t begin_ms = Entity_Get_Run_Time_Ms();
+    bool ai_access = Entity_Mqtt_Client_Buffer_Contains(data, len, "agora_agent_device_access");
 	if(!Entity_Mqtt_Is_Connected(context))
 	{
 		ENTITY_LOGE("[MQTT] publish failed: reason=mqtt_not_connected state=%d\r\n", (int)context->State);
@@ -726,18 +847,39 @@ int Entity_Mqtt_Topic_Publish(Entity_Mqtt_Context_t* context, Topic_Type_e type_
 		return -1;
 	}
 	
-    switch (type_e)
-    {
-        case TOPIC_TYPE_EVENT_PUBLISH:  //事件上报发布
-        case TOPIC_TYPE_CMD_PUBLISH:    //命令应答发布
-        {
-            rc = Mqtt_Client_Publish(context->Mqtt_Client, Entity_Mqtt_Get_Topic(type_e), (const uint8_t*)data, len, qos);
-            break;
-        }
+	    switch (type_e)
+	    {
+	        case TOPIC_TYPE_EVENT_PUBLISH:  //事件上报发布
+	        case TOPIC_TYPE_CMD_PUBLISH:    //命令应答发布
+	        {
+                if (ai_access)
+                {
+                    ENTITY_LOGI("[MQTT_TRACE][T6_TOPIC_BEGIN] mono_ms=%u topic=%s len=%d qos=%d retained=%d\r\n",
+                                (unsigned int)begin_ms,
+                                Entity_Mqtt_Get_Topic(type_e),
+                                len,
+                                qos,
+                                retained);
+                }
+	            rc = Mqtt_Client_Publish(context->Mqtt_Client, Entity_Mqtt_Get_Topic(type_e), (const uint8_t*)data, len, qos);
+	            break;
+	        }
         default:
             return -1;
     }
-    bool publish_ok = (rc > 0) || ((qos == QOS0_MOST_ONCE) && (rc == 0));
+	    bool publish_ok = (rc > 0) || ((qos == QOS0_MOST_ONCE) && (rc == 0));
+    if (ai_access)
+    {
+        uint32_t end_ms = Entity_Get_Run_Time_Ms();
+        ENTITY_LOGI("[MQTT_TRACE][T6_TOPIC_END] begin_ms=%u end_ms=%u cost_ms=%u rc=%d ok=%d len=%d qos=%d\r\n",
+                    (unsigned int)begin_ms,
+                    (unsigned int)end_ms,
+                    (unsigned int)(end_ms - begin_ms),
+                    rc,
+                    publish_ok ? 1 : 0,
+                    len,
+                    qos);
+    }
     if (!publish_ok)
     {
         ENTITY_LOGI("[MQTT_PUB] publish failed topic=%s rc=%d\r\n", Entity_Mqtt_Get_Topic(type_e), rc);
