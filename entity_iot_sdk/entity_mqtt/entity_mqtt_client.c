@@ -516,6 +516,11 @@ int Entity_Mqtt_Force_Reconnect(Entity_Mqtt_Context_t* context, const char *reas
 	}
 
 	const char *safe_reason = (reason != NULL) ? reason : "unknown";
+	if (context->Reconnect_Pending ||
+	    context->State == ENTITY_MQTT_CONNCET_STATE)
+	{
+		return OPRT_OK;
+	}
     Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "request", safe_reason);
 	Entity_Mqtt_Set_Reconnect_Reason(context, safe_reason);
 	context->Reconnect_Pending = true;
@@ -553,6 +558,7 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 		const char *reason = context->Reconnect_Reason[0] ?
 		                     context->Reconnect_Reason : "unknown";
         Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "begin", reason);
+		context->State = ENTITY_MQTT_CONNCET_STATE;
 		context->Reconnect_Pending = false;
 		context->Prohibit_Connect = false;
 		context->Is_Connected = false;
@@ -570,7 +576,6 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 		{
 			mqtt_status = Mqtt_Client_Disconnect(context->Mqtt_Client);
 		}
-		context->State = ENTITY_MQTT_CONNCET_STATE;
 		ENTITY_LOGW("[MQTT_DIAG][STATE] %s -> %s by RECONNECT_PENDING status=%d(%s)\r\n",
 		          Entity_Mqtt_State_Str(prev_state),
 		          Entity_Mqtt_State_Str(context->State),

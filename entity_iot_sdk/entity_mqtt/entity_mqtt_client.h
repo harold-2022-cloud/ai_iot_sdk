@@ -60,6 +60,31 @@ struct Entity_Mqtt_Context{
     char Reconnect_Reason[48];
 };
 
+typedef enum
+{
+    ENTITY_MQTT_EFFECTIVE_DISCONNECTED = 0,
+    ENTITY_MQTT_EFFECTIVE_CONNECTING,
+    ENTITY_MQTT_EFFECTIVE_SUBSCRIBING,
+    ENTITY_MQTT_EFFECTIVE_READY,
+    ENTITY_MQTT_EFFECTIVE_PROBING,
+    ENTITY_MQTT_EFFECTIVE_DEAD,
+} Entity_Mqtt_Effective_State_t;
+
+typedef struct
+{
+    bool app_connected;
+    bool broker_ok;
+    Mqtt_Client_Broker_Liveness_t broker_state;
+    bool stale_puback;
+} Entity_Mqtt_Effective_Input_t;
+
+const char *Entity_Mqtt_Effective_State_Str(Entity_Mqtt_Effective_State_t state);
+Entity_Mqtt_Effective_State_t Entity_Mqtt_Effective_State_From_Input(const Entity_Mqtt_Context_t *context,
+                                                                      const Entity_Mqtt_Effective_Input_t *input);
+bool Entity_Mqtt_Effective_Can_Publish(Entity_Mqtt_Effective_State_t state);
+bool Entity_Mqtt_Effective_Can_Drain(Entity_Mqtt_Effective_State_t state);
+bool Entity_Mqtt_Effective_Should_Reconnect(Entity_Mqtt_Effective_State_t state);
+
 //MQTT消息结构体
 typedef struct 
 {

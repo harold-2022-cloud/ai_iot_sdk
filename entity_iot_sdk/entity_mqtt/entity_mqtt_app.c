@@ -100,6 +100,10 @@ typedef struct
 #define ENTITY_MQTT_AGENT_QUEUE_SIZE  16
 static Entity_Queue_t s_agent_queue = NULL;
 static uint32_t s_last_queue_wait_log_ms = 0;
+static uint32_t s_last_publish_gate_log_ms = 0;
+static uint32_t s_last_ai_publish_ready_log_ms = 0;
+static uint32_t s_last_ai_publish_reconnect_decision_log_ms = 0;
+static uint32_t s_last_ai_link_health_log_ms = 0;
 static uint32_t s_last_app_heartbeat_ms = 0;
 static volatile bool s_connected_post_pending = false;
 static volatile uint32_t s_connected_post_seq = 0;
@@ -174,37 +178,35 @@ const char *Entity_Mqtt_App_Broker_State_Name(uint8_t state)
     return Mqtt_Client_Broker_Liveness_Str((Mqtt_Client_Broker_Liveness_t)state);
 }
 
-static Mqtt_Client_Broker_Liveness_t Entity_Mqtt_App_Normalize_Broker_State(const Entity_Mqtt_Context_t *context,
-                                                                            Mqtt_Client_Broker_Liveness_t core_state)
+static Entity_Mqtt_Effective_State_t Entity_Mqtt_App_Get_Effective_State(Entity_Mqtt_Context_t *context,
+                                                                         bool stale_puback,
+                                                                         Mqtt_Client_Broker_Liveness_Snapshot_t *broker_out,
+                                                                         bool *broker_ok_out)
 {
-    if (context == NULL)
+    Mqtt_Client_Broker_Liveness_Snapshot_t broker = {0};
+    bool broker_ok = false;
+    Entity_Mqtt_Effective_Input_t input = {0};
+
+    if (context != NULL && context->Mqtt_Client != NULL)
     {
-        return MQTT_BROKER_LIVENESS_DISCONNECTED;
+        broker_ok = Mqtt_Client_Broker_Liveness_Snapshot(context->Mqtt_Client, &broker);
     }
 
-    switch (context->State)
+    input.app_connected = s_mqtt_app_connected;
+    input.broker_ok = broker_ok;
+    input.broker_state = broker.state;
+    input.stale_puback = stale_puback;
+
+    if (broker_out != NULL)
     {
-        case ENTITY_MQTT_IDLE_STATE:
-            return MQTT_BROKER_LIVENESS_DISCONNECTED;
-        case ENTITY_MQTT_CONNCET_STATE:
-        case ENTITY_MQTT_RECONNECT_STATE:
-            return MQTT_BROKER_LIVENESS_CONNECTING;
-        case ENTITY_MQTT_SUBSCRIBING_STATE:
-        case ENTITY_MQTT_SUBSCRIBE_COMPLETE_STATE:
-            return MQTT_BROKER_LIVENESS_SUBSCRIBING;
-        default:
-            return core_state;
+        *broker_out = broker;
     }
-}
+    if (broker_ok_out != NULL)
+    {
+        *broker_ok_out = broker_ok;
+    }
 
-static bool Entity_Mqtt_App_Broker_Allows_Ai_Publish(Mqtt_Client_Broker_Liveness_t state)
-{
-    return state == MQTT_BROKER_LIVENESS_READY;
-}
-
-static bool Entity_Mqtt_App_Broker_Healthy_For_Ai_Wait(Mqtt_Client_Broker_Liveness_t state)
-{
-    return state == MQTT_BROKER_LIVENESS_READY;
+    return Entity_Mqtt_Effective_State_From_Input(context, &input);
 }
 
 static uint32_t Entity_Mqtt_App_Now_Ms(void)
@@ -266,8 +268,27 @@ static bool Entity_Mqtt_App_Topic_Equals(const char *rx_topic, const char *expec
 
 static void Entity_Mqtt_App_Drain_Agent_Queue(Entity_Mqtt_Context_t *entity_context)
 {
-    if (entity_context == NULL || !entity_context->Is_Connected || s_agent_queue == NULL)
+    if (entity_context == NULL || s_agent_queue == NULL)
     {
+        return;
+    }
+
+    Entity_Mqtt_Effective_State_t effective =
+        Entity_Mqtt_App_Get_Effective_State(entity_context, false, NULL, NULL);
+
+    if (!Entity_Mqtt_Effective_Can_Drain(effective))
+    {
+        uint32_t queue_depth = (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue);
+        if (queue_depth > 0)
+        {
+            ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DRAIN_GATE] drain=0 effective=%s raw_ctx_connected=%d "
+                                     "raw_app_connected=%d state=%s queue_depth=%u\r\n",
+                                     Entity_Mqtt_Effective_State_Str(effective),
+                                     entity_context->Is_Connected ? 1 : 0,
+                                     s_mqtt_app_connected ? 1 : 0,
+                                     Entity_Mqtt_App_State_Str(entity_context->State),
+                                     (unsigned int)queue_depth);
+        }
         return;
     }
 
@@ -952,16 +973,25 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
      *      導致 Controller Task 卡住 20s。
      *   3. 資料生命週期由 data_copy（PSRAM）延伸至 Agent Task 消費完畢。*/
 
-    if (!s_mqtt_app_connected)
+    Entity_Mqtt_Effective_State_t effective =
+        Entity_Mqtt_App_Get_Effective_State(&Entity_Client_Instance, false, NULL, NULL);
+
+    if (!Entity_Mqtt_Effective_Can_Publish(effective))
     {
-        ENTITY_LOGW("[MQTT_PUB] publish skipped: reason=subscription_not_ready flag=false\r\n");
-        ENTITY_LOGW("[MQTT_DIAG][PUB_SKIP_APP_FLAG] state=%s ctx_connected=%d "
-                  "queue_depth=%u len=%d qos=%d\r\n",
-                  Entity_Mqtt_App_State_Str(Entity_Client_Instance.State),
-                  Entity_Client_Instance.Is_Connected ? 1 : 0,
-                  s_agent_queue ? (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0,
-                  len,
-                  qos);
+        uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
+        if (now_ms - s_last_publish_gate_log_ms >= 2000)
+        {
+            s_last_publish_gate_log_ms = now_ms;
+            ENTITY_LOGW("[MQTT_PUBLISH_GATE] accept=0 effective=%s raw_app_connected=%d "
+                        "raw_ctx_connected=%d state=%s queue_depth=%u len=%d qos=%d\r\n",
+                        Entity_Mqtt_Effective_State_Str(effective),
+                        s_mqtt_app_connected ? 1 : 0,
+                        Entity_Client_Instance.Is_Connected ? 1 : 0,
+                        Entity_Mqtt_App_State_Str(Entity_Client_Instance.State),
+                        s_agent_queue ? (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0,
+                        len,
+                        qos);
+        }
         return OPRT_COM_ERROR;
     }
     if (s_agent_queue == NULL)
@@ -1056,30 +1086,71 @@ bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
     bool stale_puback = false;
     Mqtt_Client_Broker_Liveness_Snapshot_t broker = {0};
     bool broker_ok = false;
-
-    if (!Entity_Mqtt_App_Is_Connected())
-    {
-        ENTITY_LOGW("[MQTT_DIAG][AI_PUBLISH_NOT_READY] app_connected=0 state=%s ctx_connected=%d\r\n",
-                  Entity_Mqtt_App_State_Str(context->State),
-                  context->Is_Connected ? 1 : 0);
-        return false;
-    }
+    Entity_Mqtt_Effective_State_t effective;
 
     (void)Mqtt_Client_Pending_Qos1_Snapshot(context->Mqtt_Client,
                                             &pending_count,
                                             &oldest_age_ms,
                                             &oldest_msg_id);
-    broker_ok = Mqtt_Client_Broker_Liveness_Snapshot(context->Mqtt_Client, &broker);
-    broker.state = Entity_Mqtt_App_Normalize_Broker_State(context, broker.state);
     stale_puback = (pending_count > 0U) &&
                    (oldest_age_ms >= ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
+    broker_ok = false;
+    effective = Entity_Mqtt_App_Get_Effective_State(context, stale_puback, &broker, &broker_ok);
 
-    if (broker_ok && Entity_Mqtt_App_Broker_Allows_Ai_Publish(broker.state) && !stale_puback)
+    if (Entity_Mqtt_Effective_Can_Publish(effective))
     {
-        ENTITY_LOGI("[MQTT_DIAG][AI_PUBLISH_READY] broker=%s keepalive=%u pingresp_timeout=%u "
-                  "last_inbound_age=%u wait_ping=%d pingreq_age=%u pingresp_rtt=%u "
-                  "last_rx_age=%u pending_qos1=%u oldest_msgid=%u oldest_age=%u\r\n",
+        uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
+        if (s_last_ai_publish_ready_log_ms == 0U ||
+            now_ms - s_last_ai_publish_ready_log_ms >= 2000)
+        {
+            s_last_ai_publish_ready_log_ms = now_ms;
+            ENTITY_LOGI("[MQTT_EFFECTIVE_STATE] stage=ai_publish_ready effective=%s "
+                      "broker_ok=%d broker=%s raw_ctx_connected=%d raw_app_connected=%d "
+                      "stale_puback=%d keepalive=%u pingresp_timeout=%u last_inbound_age=%u "
+                      "wait_ping=%d pingreq_age=%u pingresp_rtt=%u last_rx_age=%u "
+                      "pending_qos1=%u oldest_msgid=%u oldest_age=%u\r\n",
+                      Entity_Mqtt_Effective_State_Str(effective),
+                      broker_ok ? 1 : 0,
+                      Mqtt_Client_Broker_Liveness_Str(broker.state),
+                      context->Is_Connected ? 1 : 0,
+                      s_mqtt_app_connected ? 1 : 0,
+                      stale_puback ? 1 : 0,
+                      (unsigned int)broker.keepalive_ms,
+                      (unsigned int)broker.pingresp_timeout_ms,
+                      (unsigned int)broker.last_inbound_alive_age_ms,
+                      broker.wait_ping ? 1 : 0,
+                      (unsigned int)broker.pingreq_age_ms,
+                      (unsigned int)broker.last_pingresp_rtt_ms,
+                      (unsigned int)last_rx_age_ms,
+                      (unsigned int)pending_count,
+                      (unsigned int)oldest_msg_id,
+                      (unsigned int)oldest_age_ms);
+        }
+        return true;
+    }
+
+    bool request_reconnect = Entity_Mqtt_Effective_Should_Reconnect(effective);
+    bool reconnect_pending = context->Reconnect_Pending;
+    bool issue_reconnect = request_reconnect && !reconnect_pending;
+    uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
+    if (issue_reconnect ||
+        s_last_ai_publish_reconnect_decision_log_ms == 0U ||
+        now_ms - s_last_ai_publish_reconnect_decision_log_ms >= 2000)
+    {
+        s_last_ai_publish_reconnect_decision_log_ms = now_ms;
+        ENTITY_LOGW("[MQTT_RECONNECT_DECISION] stage=ai_publish effective=%s broker_ok=%d broker=%s "
+                  "request_reconnect=%d reconnect_pending=%d raw_ctx_connected=%d raw_app_connected=%d "
+                  "stale_puback=%d keepalive=%u pingresp_timeout=%u last_inbound_age=%u "
+                  "wait_ping=%d pingreq_age=%u pingresp_rtt=%u last_rx_age=%u "
+                  "pending_qos1=%u oldest_msgid=%u oldest_age=%u stale_puback_ms=%u\r\n",
+                  Entity_Mqtt_Effective_State_Str(effective),
+                  broker_ok ? 1 : 0,
                   Mqtt_Client_Broker_Liveness_Str(broker.state),
+                  request_reconnect ? 1 : 0,
+                  reconnect_pending ? 1 : 0,
+                  context->Is_Connected ? 1 : 0,
+                  s_mqtt_app_connected ? 1 : 0,
+                  stale_puback ? 1 : 0,
                   (unsigned int)broker.keepalive_ms,
                   (unsigned int)broker.pingresp_timeout_ms,
                   (unsigned int)broker.last_inbound_alive_age_ms,
@@ -1089,47 +1160,19 @@ bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
                   (unsigned int)last_rx_age_ms,
                   (unsigned int)pending_count,
                   (unsigned int)oldest_msg_id,
-                  (unsigned int)oldest_age_ms);
-        return true;
+                  (unsigned int)oldest_age_ms,
+                  (unsigned int)ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
     }
 
-    bool request_reconnect = stale_puback ||
-                             (broker.state == MQTT_BROKER_LIVENESS_PROBING) ||
-                             (broker.state == MQTT_BROKER_LIVENESS_DEAD) ||
-                             (broker.state == MQTT_BROKER_LIVENESS_DISCONNECTED);
-    ENTITY_LOGW("[MQTT_DIAG][AI_PUBLISH_NOT_READY] broker_ok=%d broker=%s request_reconnect=%d "
-              "stale_puback=%d keepalive=%u pingresp_timeout=%u last_inbound_age=%u "
-              "wait_ping=%d pingreq_age=%u pingresp_rtt=%u last_rx_age=%u "
-              "pending_qos1=%u oldest_msgid=%u oldest_age=%u stale_puback_ms=%u\r\n",
-              broker_ok ? 1 : 0,
-              Mqtt_Client_Broker_Liveness_Str(broker.state),
-              request_reconnect ? 1 : 0,
-              stale_puback ? 1 : 0,
-              (unsigned int)broker.keepalive_ms,
-              (unsigned int)broker.pingresp_timeout_ms,
-              (unsigned int)broker.last_inbound_alive_age_ms,
-              broker.wait_ping ? 1 : 0,
-              (unsigned int)broker.pingreq_age_ms,
-              (unsigned int)broker.last_pingresp_rtt_ms,
-              (unsigned int)last_rx_age_ms,
-              (unsigned int)pending_count,
-              (unsigned int)oldest_msg_id,
-              (unsigned int)oldest_age_ms,
-              (unsigned int)ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
-
-    if (request_reconnect)
+    if (issue_reconnect)
     {
+        const char *reason = stale_puback ? "ai_publish_pending_qos1" :
+                             (effective == ENTITY_MQTT_EFFECTIVE_DEAD) ? "ai_publish_broker_dead" :
+                             "ai_publish_disconnected";
         Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot("ai_publish_not_ready",
-                                        stale_puback ? "ai_publish_pending_qos1" :
-                                        (broker.state == MQTT_BROKER_LIVENESS_PROBING) ? "ai_publish_broker_probing" :
-                                        (broker.state == MQTT_BROKER_LIVENESS_DEAD) ? "ai_publish_broker_dead" :
-                                        "ai_publish_broker_disconnected");
+                                                       reason);
         s_mqtt_app_connected = false;
-        (void)Entity_Mqtt_Force_Reconnect(context,
-                                        stale_puback ? "ai_publish_pending_qos1" :
-                                        (broker.state == MQTT_BROKER_LIVENESS_PROBING) ? "ai_publish_broker_probing" :
-                                        (broker.state == MQTT_BROKER_LIVENESS_DEAD) ? "ai_publish_broker_dead" :
-                                        "ai_publish_broker_disconnected");
+        (void)Entity_Mqtt_Force_Reconnect(context, reason);
     }
     return false;
 }
@@ -1145,46 +1188,48 @@ bool Entity_Mqtt_App_Is_Ai_Link_Healthy(void)
     bool healthy = false;
     Mqtt_Client_Broker_Liveness_Snapshot_t broker = {0};
     bool broker_ok = false;
-
-    if (!Entity_Mqtt_App_Is_Connected())
-    {
-        ENTITY_LOGW("[MQTT_DIAG][AI_LINK_HEALTH] healthy=0 app_connected=0 state=%s ctx_connected=%d\r\n",
-                  Entity_Mqtt_App_State_Str(context->State),
-                  context->Is_Connected ? 1 : 0);
-        return false;
-    }
+    Entity_Mqtt_Effective_State_t effective;
+    uint32_t now_ms;
 
     (void)Mqtt_Client_Pending_Qos1_Snapshot(context->Mqtt_Client,
                                             &pending_count,
                                             &oldest_age_ms,
                                             &oldest_msg_id);
-    broker_ok = Mqtt_Client_Broker_Liveness_Snapshot(context->Mqtt_Client, &broker);
-    broker.state = Entity_Mqtt_App_Normalize_Broker_State(context, broker.state);
     stale_puback = (pending_count > 0U) &&
                    (oldest_age_ms >= ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
-    healthy = broker_ok &&
-              Entity_Mqtt_App_Broker_Healthy_For_Ai_Wait(broker.state) &&
-              !stale_puback;
+    effective = Entity_Mqtt_App_Get_Effective_State(context, stale_puback, &broker, &broker_ok);
+    healthy = Entity_Mqtt_Effective_Can_Publish(effective);
 
-    ENTITY_LOGI("[MQTT_DIAG][AI_LINK_HEALTH] healthy=%d broker_ok=%d broker=%s "
-              "stale_puback=%d keepalive=%u pingresp_timeout=%u last_inbound_age=%u "
-              "wait_ping=%d pingreq_age=%u pingresp_rtt=%u last_rx_age=%u "
-              "pending_qos1=%u oldest_msgid=%u oldest_age=%u stale_puback_ms=%u\r\n",
-              healthy ? 1 : 0,
-              broker_ok ? 1 : 0,
-              Mqtt_Client_Broker_Liveness_Str(broker.state),
-              stale_puback ? 1 : 0,
-              (unsigned int)broker.keepalive_ms,
-              (unsigned int)broker.pingresp_timeout_ms,
-              (unsigned int)broker.last_inbound_alive_age_ms,
-              broker.wait_ping ? 1 : 0,
-              (unsigned int)broker.pingreq_age_ms,
-              (unsigned int)broker.last_pingresp_rtt_ms,
-              (unsigned int)last_rx_age_ms,
-              (unsigned int)pending_count,
-              (unsigned int)oldest_msg_id,
-              (unsigned int)oldest_age_ms,
-              (unsigned int)ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
+    now_ms = Entity_Mqtt_App_Now_Ms();
+    if (s_last_ai_link_health_log_ms == 0U ||
+        now_ms - s_last_ai_link_health_log_ms >= 2000)
+    {
+        s_last_ai_link_health_log_ms = now_ms;
+        ENTITY_LOGI("[MQTT_DIAG][AI_LINK_HEALTH] healthy=%d effective=%s broker_ok=%d broker=%s "
+                  "raw_ctx_connected=%d raw_app_connected=%d state=%s stale_puback=%d "
+                  "keepalive=%u pingresp_timeout=%u last_inbound_age=%u wait_ping=%d "
+                  "pingreq_age=%u pingresp_rtt=%u last_rx_age=%u pending_qos1=%u "
+                  "oldest_msgid=%u oldest_age=%u stale_puback_ms=%u\r\n",
+                  healthy ? 1 : 0,
+                  Entity_Mqtt_Effective_State_Str(effective),
+                  broker_ok ? 1 : 0,
+                  Mqtt_Client_Broker_Liveness_Str(broker.state),
+                  context->Is_Connected ? 1 : 0,
+                  s_mqtt_app_connected ? 1 : 0,
+                  Entity_Mqtt_App_State_Str(context->State),
+                  stale_puback ? 1 : 0,
+                  (unsigned int)broker.keepalive_ms,
+                  (unsigned int)broker.pingresp_timeout_ms,
+                  (unsigned int)broker.last_inbound_alive_age_ms,
+                  broker.wait_ping ? 1 : 0,
+                  (unsigned int)broker.pingreq_age_ms,
+                  (unsigned int)broker.last_pingresp_rtt_ms,
+                  (unsigned int)last_rx_age_ms,
+                  (unsigned int)pending_count,
+                  (unsigned int)oldest_msg_id,
+                  (unsigned int)oldest_age_ms,
+                  (unsigned int)ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS);
+    }
     return healthy;
 }
 
@@ -1214,7 +1259,6 @@ bool Entity_Mqtt_App_Get_Health_Snapshot(Entity_Mqtt_App_Health_Snapshot_t *snap
     Mqtt_Client_Broker_Liveness_Snapshot_t broker = {0};
     if (Mqtt_Client_Broker_Liveness_Snapshot(context->Mqtt_Client, &broker))
     {
-        broker.state = Entity_Mqtt_App_Normalize_Broker_State(context, broker.state);
         snapshot->broker_state = (uint8_t)broker.state;
         snapshot->broker_pingresp_timeout_ms = broker.pingresp_timeout_ms;
         snapshot->broker_last_inbound_alive_age_ms = broker.last_inbound_alive_age_ms;
@@ -1257,6 +1301,11 @@ void Entity_Mqtt_App_Reset_Keepalive(void)
 
 bool Entity_Mqtt_App_Force_Reconnect(const char *reason)
 {
+    if (Entity_Client_Instance.Reconnect_Pending ||
+        Entity_Client_Instance.State == ENTITY_MQTT_CONNCET_STATE)
+    {
+        return true;
+    }
     Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot("force_reconnect", reason);
     s_mqtt_app_connected = false;
     return Entity_Mqtt_Force_Reconnect(&Entity_Client_Instance, reason) == OPRT_OK;

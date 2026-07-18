@@ -2,6 +2,7 @@ CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Wno-type-limits -Wno-unused-function
 CFLAGS += -DBSP_SYSTEM_BK7258_ALLOCATOR_ONLY
 CFLAGS += -I../../platform_os -Istubs -I../../media/rtc_facade/include -I../../media/rtc_facade/src -I../../media/rtc_facade/src/agora -I../../base64 -Ifakes
+CFLAGS += -I../../entity_iot_sdk/entity_mqtt -I../../entity_iot_sdk/entity_iot -I../../library/mi_mqtt
 CFLAGS += $(CFLAGS_EXTRA)
 
 TARGET := test_bk7258_allocator_guard
@@ -14,17 +15,20 @@ RTC_AGORA_RTM_TARGET := test_ai_rtc_facade_agora_backend_rtm
 RTC_AGORA_RTM_SRCS := test_ai_rtc_facade_agora_backend_rtm.c ../../media/rtc_facade/src/ai_rtc_facade.c ../../media/rtc_facade/src/ai_rtc_facade_agora_backend.c ../../media/rtc_facade/src/agora/ai_rtc_agora_service.c ../../media/rtc_facade/src/agora/ai_rtc_agora_control_datastream.c ../../media/rtc_facade/src/agora/ai_rtc_agora_control_rtm.c ../../media/rtc_facade/src/agora/ai_rtc_agora_datastream.c stubs/agora_rtc_stub.c stubs/ai_rtc_agora_port_stub.c stubs/cJSON_stub.c stubs/base_64_stub.c
 RTC_AGORA_DATASTREAM_TARGET := test_ai_rtc_agora_datastream
 RTC_AGORA_DATASTREAM_SRCS := test_ai_rtc_agora_datastream.c ../../media/rtc_facade/src/agora/ai_rtc_agora_datastream.c stubs/cJSON_stub.c stubs/base_64_stub.c
+ENTITY_MQTT_EFFECTIVE_TARGET := test_entity_mqtt_effective_state
+ENTITY_MQTT_EFFECTIVE_SRCS := test_entity_mqtt_effective_state.c ../../entity_iot_sdk/entity_mqtt/entity_mqtt_effective_state.c
 
-.PHONY: all test check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers clean
+.PHONY: all test check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers check_entity_mqtt_effective_state_policy clean
 
-all: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET)
+all: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) $(ENTITY_MQTT_EFFECTIVE_TARGET)
 
-test: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers
+test: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) $(ENTITY_MQTT_EFFECTIVE_TARGET) check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers check_entity_mqtt_effective_state_policy
 	./$(TARGET)
 	./$(RTC_CORE_TARGET)
 	./$(RTC_AGORA_TARGET)
 	./$(RTC_AGORA_RTM_TARGET)
 	./$(RTC_AGORA_DATASTREAM_TARGET)
+	./$(ENTITY_MQTT_EFFECTIVE_TARGET)
 
 check_entity_interface_reference_template:
 	python3 check_entity_interface_reference_template.py
@@ -44,6 +48,9 @@ check_ai_rtc_control_transport_buildtime:
 check_ai_rtc_diagnostic_markers:
 	python3 check_ai_rtc_diagnostic_markers.py
 
+check_entity_mqtt_effective_state_policy:
+	python3 check_entity_mqtt_effective_state_policy.py
+
 $(TARGET): $(SRCS) stubs/os/os.h stubs/os/mem.h
 	$(CC) $(CFLAGS) $(SRCS) -o $@
 
@@ -59,5 +66,8 @@ $(RTC_AGORA_RTM_TARGET): $(RTC_AGORA_RTM_SRCS)
 $(RTC_AGORA_DATASTREAM_TARGET): $(RTC_AGORA_DATASTREAM_SRCS)
 	$(CC) $(CFLAGS) $(RTC_AGORA_DATASTREAM_SRCS) -o $@
 
+$(ENTITY_MQTT_EFFECTIVE_TARGET): $(ENTITY_MQTT_EFFECTIVE_SRCS)
+	$(CC) $(CFLAGS) $(ENTITY_MQTT_EFFECTIVE_SRCS) -o $@
+
 clean:
-	rm -f $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET)
+	rm -f $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) $(ENTITY_MQTT_EFFECTIVE_TARGET)
