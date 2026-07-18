@@ -16,6 +16,15 @@ DMA, LCD, AVI playback, buttons, BLE/Wi-Fi provisioning, HTTP/MQTT product
 flows, PA GPIO, audio engine startup order, and product resource policy remain
 product/platform responsibilities.
 
+For solution providers, this is the most important split:
+
+- SDK-owned: RTC audio/video transport, datastream transport, private RTM
+  backend option, Agora vendor headers/libraries, and RTC lifecycle state.
+- Product-owned: microphone capture, speaker playback, codec/AEC setup, DMA
+  sizing, LCD/AVI/camera workload, buttons, BLE/Wi-Fi provisioning, HTTP/MQTT
+  business flow, NFC, 4G/modem/PPP bring-up, GPIO mapping, power policy, and UI
+  behavior.
+
 The public API boundary is:
 
 ```text

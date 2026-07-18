@@ -15,11 +15,11 @@ RTC_AGORA_RTM_SRCS := test_ai_rtc_facade_agora_backend_rtm.c ../../media/rtc_fac
 RTC_AGORA_DATASTREAM_TARGET := test_ai_rtc_agora_datastream
 RTC_AGORA_DATASTREAM_SRCS := test_ai_rtc_agora_datastream.c ../../media/rtc_facade/src/agora/ai_rtc_agora_datastream.c stubs/cJSON_stub.c stubs/base_64_stub.c
 
-.PHONY: all test check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime clean
+.PHONY: all test check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers clean
 
 all: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET)
 
-test: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime
+test: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers
 	./$(TARGET)
 	./$(RTC_CORE_TARGET)
 	./$(RTC_AGORA_TARGET)
@@ -40,6 +40,9 @@ check_ai_rtc_facade_sdk_agora_migration:
 
 check_ai_rtc_control_transport_buildtime:
 	python3 check_ai_rtc_control_transport_buildtime.py
+
+check_ai_rtc_diagnostic_markers:
+	python3 check_ai_rtc_diagnostic_markers.py
 
 $(TARGET): $(SRCS) stubs/os/os.h stubs/os/mem.h
 	$(CC) $(CFLAGS) $(SRCS) -o $@
