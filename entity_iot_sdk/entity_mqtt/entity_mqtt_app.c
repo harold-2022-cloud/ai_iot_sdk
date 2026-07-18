@@ -99,6 +99,9 @@ typedef struct
 
 #define ENTITY_MQTT_AGENT_QUEUE_SIZE  16
 static Entity_Queue_t s_agent_queue = NULL;
+static Entity_Mutex_t s_ai_deferred_mutex = NULL;
+static Entity_Mqtt_Agent_Cmd_t s_ai_deferred_cmd = {0};
+static bool s_ai_deferred_cmd_valid = false;
 static uint32_t s_last_queue_wait_log_ms = 0;
 static uint32_t s_last_publish_gate_log_ms = 0;
 static uint32_t s_last_ai_publish_ready_log_ms = 0;
@@ -264,6 +267,179 @@ static bool Entity_Mqtt_App_Topic_Equals(const char *rx_topic, const char *expec
     size_t rx_len = strlen(rx_topic);
     size_t expected_len = strlen(expected_topic);
     return (rx_len == expected_len) && (memcmp(rx_topic, expected_topic, rx_len) == 0);
+}
+
+static void Entity_Mqtt_App_Deferred_Lock(void)
+{
+    if (s_ai_deferred_mutex != NULL)
+    {
+        Entity_Mutex_Lock(&s_ai_deferred_mutex, ENTITY_WAIT_FOREVER);
+    }
+}
+
+static void Entity_Mqtt_App_Deferred_Unlock(void)
+{
+    if (s_ai_deferred_mutex != NULL)
+    {
+        Entity_Mutex_Unlock(&s_ai_deferred_mutex);
+    }
+}
+
+static int Entity_Mqtt_App_Enqueue_Agent_Cmd(Entity_Mqtt_Agent_Cmd_t *cmd)
+{
+    if (cmd == NULL || cmd->data == NULL)
+    {
+        return OPRT_COM_ERROR;
+    }
+    if (s_agent_queue == NULL)
+    {
+        ENTITY_LOGE("[MQTT_PUB] agent queue not initialized\r\n");
+        Entity_Mem_Free(cmd->data);
+        cmd->data = NULL;
+        return OPRT_COM_ERROR;
+    }
+
+    if (Entity_Msg_Queue_Send(&s_agent_queue, cmd, sizeof(*cmd), 0) != 0)
+    {
+        ENTITY_LOGE("[MQTT_PUB] agent queue full, drop publish topic=%d\r\n", (int)cmd->topic_type);
+        ENTITY_LOGE("[MQTT_DIAG][PUB_ENQUEUE_FULL] topic=%d len=%d qos=%d depth=%u/%u\r\n",
+                  (int)cmd->topic_type,
+                  cmd->len,
+                  cmd->qos,
+                  (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
+                  (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE);
+        Entity_Mem_Free(cmd->data);
+        cmd->data = NULL;
+        return OPRT_COM_ERROR;
+    }
+    if (cmd->ai_access)
+    {
+        ENTITY_LOGI("[MQTT_TRACE][T3_ENQUEUE] trace=%u enqueue_ms=%u topic_type=%d len=%d qos=%d "
+                    "retained=%d depth=%u/%u task_prio=%u task_stack_hwm=%u\r\n",
+                    (unsigned int)cmd->trace_seq,
+                    (unsigned int)cmd->enqueue_ms,
+                    (int)cmd->topic_type,
+                    cmd->len,
+                    cmd->qos,
+                    cmd->retained,
+                    (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
+                    (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE,
+                    (unsigned int)Entity_Mqtt_App_Current_Task_Priority(),
+                    (unsigned int)Entity_Mqtt_App_Current_Task_Stack_Hwm());
+    }
+    ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][PUB_ENQUEUE] topic=%d len=%d qos=%d retained=%d "
+              "depth=%u/%u\r\n",
+              (int)cmd->topic_type,
+              cmd->len,
+              cmd->qos,
+              cmd->retained,
+              (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
+              (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE);
+    return OPRT_OK;
+}
+
+static int Entity_Mqtt_App_Store_Deferred_Ai_Publish(Entity_Mqtt_Agent_Cmd_t *cmd)
+{
+    Entity_Mqtt_Agent_Cmd_t stored;
+
+    if (cmd == NULL || !cmd->ai_access || cmd->data == NULL)
+    {
+        return OPRT_COM_ERROR;
+    }
+
+    memset(&stored, 0, sizeof(stored));
+    Entity_Mqtt_App_Deferred_Lock();
+    if (s_ai_deferred_cmd_valid && s_ai_deferred_cmd.data != NULL)
+    {
+        ENTITY_LOGW("[MQTT_AI_DEFERRED][REPLACE] old_trace=%u new_trace=%u reason=duplicate_ai_request\r\n",
+                    (unsigned int)s_ai_deferred_cmd.trace_seq,
+                    (unsigned int)cmd->trace_seq);
+        Entity_Mem_Free(s_ai_deferred_cmd.data);
+        memset(&s_ai_deferred_cmd, 0, sizeof(s_ai_deferred_cmd));
+    }
+
+    s_ai_deferred_cmd = *cmd;
+    s_ai_deferred_cmd_valid = true;
+    stored = s_ai_deferred_cmd;
+    cmd->data = NULL;
+    Entity_Mqtt_App_Deferred_Unlock();
+
+    ENTITY_LOGW("[MQTT_AI_DEFERRED][STORE] trace=%u enqueue_ms=%u topic_type=%d len=%d qos=%d reason=probing\r\n",
+                (unsigned int)stored.trace_seq,
+                (unsigned int)stored.enqueue_ms,
+                (int)stored.topic_type,
+                stored.len,
+                stored.qos);
+    return OPRT_OK;
+}
+
+static void Entity_Mqtt_App_Drop_Deferred_Ai_Publish(const char *reason)
+{
+    Entity_Mqtt_Agent_Cmd_t dropped;
+    bool had_deferred = false;
+
+    memset(&dropped, 0, sizeof(dropped));
+    Entity_Mqtt_App_Deferred_Lock();
+    if (s_ai_deferred_cmd_valid)
+    {
+        dropped = s_ai_deferred_cmd;
+        memset(&s_ai_deferred_cmd, 0, sizeof(s_ai_deferred_cmd));
+        s_ai_deferred_cmd_valid = false;
+        had_deferred = true;
+    }
+    Entity_Mqtt_App_Deferred_Unlock();
+
+    if (had_deferred)
+    {
+        ENTITY_LOGW("[MQTT_AI_DEFERRED][DROP] trace=%u reason=%s\r\n",
+                    (unsigned int)dropped.trace_seq,
+                    reason ? reason : "unknown");
+        if (dropped.data != NULL)
+        {
+            Entity_Mem_Free(dropped.data);
+        }
+        Entity_Mqtt_Clear_Token_Pending(NULL);
+    }
+}
+
+static void Entity_Mqtt_App_Drain_Deferred_Ai_Publish(Entity_Mqtt_Context_t *entity_context)
+{
+    Entity_Mqtt_Effective_State_t effective =
+        Entity_Mqtt_App_Get_Effective_State(entity_context, false, NULL, NULL);
+
+    if (Entity_Mqtt_Effective_Can_Drain(effective))
+    {
+        Entity_Mqtt_Agent_Cmd_t cmd;
+        bool had_deferred = false;
+
+        memset(&cmd, 0, sizeof(cmd));
+        Entity_Mqtt_App_Deferred_Lock();
+        if (s_ai_deferred_cmd_valid)
+        {
+            cmd = s_ai_deferred_cmd;
+            memset(&s_ai_deferred_cmd, 0, sizeof(s_ai_deferred_cmd));
+            s_ai_deferred_cmd_valid = false;
+            had_deferred = true;
+        }
+        Entity_Mqtt_App_Deferred_Unlock();
+
+        if (had_deferred)
+        {
+            ENTITY_LOGW("[MQTT_AI_DEFERRED][DRAIN_READY] trace=%u delay_ms=%u\r\n",
+                        (unsigned int)cmd.trace_seq,
+                        (unsigned int)(Entity_Mqtt_App_Now_Ms() - cmd.enqueue_ms));
+            if (Entity_Mqtt_App_Enqueue_Agent_Cmd(&cmd) != OPRT_OK)
+            {
+                Entity_Mqtt_Clear_Token_Pending(NULL);
+            }
+        }
+        return;
+    }
+
+    if (Entity_Mqtt_Effective_Should_Reconnect(effective))
+    {
+        Entity_Mqtt_App_Drop_Deferred_Ai_Publish(Entity_Mqtt_Effective_State_Str(effective));
+    }
 }
 
 static void Entity_Mqtt_App_Drain_Agent_Queue(Entity_Mqtt_Context_t *entity_context)
@@ -578,6 +754,7 @@ static void Entity_Mqtt_Disconnected_Callback(Entity_Mqtt_Context_t* context, vo
     (void)user_data;
     s_mqtt_app_connected = false;
     s_connected_post_pending = false;
+    Entity_Mqtt_App_Drop_Deferred_Ai_Publish("app_disconnected");
     ENTITY_LOGI("----------now mqtt client disconnected-----------\r\n");
     ENTITY_LOGW("[MQTT_DIAG][APP_DISCONNECTED_CB] state=%s ctx_connected=%d queue_depth=%u\r\n",
               Entity_Mqtt_App_State_Str(context->State),
@@ -772,6 +949,7 @@ void Entity_Mqtt_Client_Task(void *arg)
          * 4. 按需睡眠後繼續下一輪。*/
         s_mqtt_task_priority = Entity_Mqtt_App_Current_Task_Priority();
         s_mqtt_task_stack_hwm = Entity_Mqtt_App_Current_Task_Stack_Hwm();
+        Entity_Mqtt_App_Drain_Deferred_Ai_Publish(entity_context);
         Entity_Mqtt_App_Drain_Agent_Queue(entity_context);
         uint32_t loop_enter_ms = Entity_Mqtt_App_Now_Ms();
         uint32_t loop_enter_depth = s_agent_queue ? (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0;
@@ -824,6 +1002,7 @@ void Entity_Mqtt_Client_Task(void *arg)
             }
         }
 
+        Entity_Mqtt_App_Drain_Deferred_Ai_Publish(entity_context);
         Entity_Mqtt_App_Drain_Agent_Queue(entity_context);
 
         if (entity_context->Is_Connected && s_agent_queue != NULL &&
@@ -873,6 +1052,8 @@ int Entity_Mqtt_Client_Task_Start(void)
     }
     if (s_cb_mutex == NULL)
         Entity_Mutex_Create(&s_cb_mutex);
+    if (s_ai_deferred_mutex == NULL)
+        Entity_Mutex_Create(&s_ai_deferred_mutex);
     /* 初始化 Agent 指令隊列（冪等，重複呼叫安全）*/
     if (s_agent_queue == NULL)
     {
@@ -916,6 +1097,7 @@ int Entity_Mqtt_Client_Task_Stop(void)
     {
         Flag_Entity_Mqtt_App_Task_Runing = 0;
         Entity_Mqtt_Context_t *entity_context = (Entity_Mqtt_Context_t *)&Entity_Client_Instance;
+        Entity_Mqtt_App_Drop_Deferred_Ai_Publish("task_stop");
         Entity_Mqtt_Manu_Disconnect(entity_context);
         while(!Flag_Entity_Mqtt_App_Task_Over)//等待任务结束
             Entity_Sleep_Ms(10);
@@ -973,11 +1155,50 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
      *      導致 Controller Task 卡住 20s。
      *   3. 資料生命週期由 data_copy（PSRAM）延伸至 Agent Task 消費完畢。*/
 
+    bool ai_access = Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_device_access");
     Entity_Mqtt_Effective_State_t effective =
         Entity_Mqtt_App_Get_Effective_State(&Entity_Client_Instance, false, NULL, NULL);
 
     if (!Entity_Mqtt_Effective_Can_Publish(effective))
     {
+        if (ai_access && effective == ENTITY_MQTT_EFFECTIVE_PROBING)
+        {
+            if (s_agent_queue == NULL)
+            {
+                ENTITY_LOGE("[MQTT_AI_DEFERRED][STORE_FAIL] reason=queue_null len=%d\r\n", len);
+                Entity_Mqtt_Clear_Token_Pending(NULL);
+                return OPRT_COM_ERROR;
+            }
+
+            void *deferred_copy = Entity_Mem_Malloc((unsigned int)len);
+            if (deferred_copy == NULL)
+            {
+                deferred_copy = malloc((size_t)len);
+            }
+            if (deferred_copy == NULL)
+            {
+                ENTITY_LOGE("[MQTT_AI_DEFERRED][STORE_FAIL] reason=alloc len=%d\r\n", len);
+                Entity_Mqtt_Clear_Token_Pending(NULL);
+                return OPRT_COM_ERROR;
+            }
+            memcpy(deferred_copy, data, (size_t)len);
+
+            Entity_Mqtt_Agent_Cmd_t deferred_cmd =
+            {
+                .type       = AGENT_CMD_PUBLISH,
+                .topic_type = type_e,
+                .data       = deferred_copy,
+                .len        = len,
+                .qos        = qos,
+                .retained   = retained,
+                .trace_seq  = ++s_agent_trace_seq,
+                .enqueue_ms = Entity_Mqtt_App_Now_Ms(),
+                .ai_access  = true,
+            };
+
+            return Entity_Mqtt_App_Store_Deferred_Ai_Publish(&deferred_cmd);
+        }
+
         uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
         if (now_ms - s_last_publish_gate_log_ms >= 2000)
         {
@@ -992,11 +1213,6 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
                         len,
                         qos);
         }
-        return OPRT_COM_ERROR;
-    }
-    if (s_agent_queue == NULL)
-    {
-        ENTITY_LOGE("[MQTT_PUB] agent queue not initialized\r\n");
         return OPRT_COM_ERROR;
     }
 
@@ -1024,46 +1240,10 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
         .retained   = retained,
         .trace_seq  = ++s_agent_trace_seq,
         .enqueue_ms = Entity_Mqtt_App_Now_Ms(),
-        .ai_access  = Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_device_access"),
+        .ai_access  = ai_access,
     };
 
-    if (Entity_Msg_Queue_Send(&s_agent_queue, &cmd, sizeof(cmd), 0) != 0)
-    {
-        /* 隊列已滿（16 項），本次丟棄並釋放副本 */
-        ENTITY_LOGE("[MQTT_PUB] agent queue full, drop publish topic=%d\r\n", (int)type_e);
-        ENTITY_LOGE("[MQTT_DIAG][PUB_ENQUEUE_FULL] topic=%d len=%d qos=%d depth=%u/%u\r\n",
-                  (int)type_e,
-                  len,
-                  qos,
-                  (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
-                  (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE);
-        Entity_Mem_Free(data_copy);
-        return OPRT_COM_ERROR;
-    }
-    if (cmd.ai_access)
-    {
-        ENTITY_LOGI("[MQTT_TRACE][T3_ENQUEUE] trace=%u enqueue_ms=%u topic_type=%d len=%d qos=%d "
-                    "retained=%d depth=%u/%u task_prio=%u task_stack_hwm=%u\r\n",
-                    (unsigned int)cmd.trace_seq,
-                    (unsigned int)cmd.enqueue_ms,
-                    (int)type_e,
-                    len,
-                    qos,
-                    retained,
-                    (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
-                    (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE,
-                    (unsigned int)Entity_Mqtt_App_Current_Task_Priority(),
-                    (unsigned int)Entity_Mqtt_App_Current_Task_Stack_Hwm());
-    }
-    ENTITY_MQTT_VERBOSE_LOGI("[MQTT_DIAG][PUB_ENQUEUE] topic=%d len=%d qos=%d retained=%d "
-              "depth=%u/%u\r\n",
-              (int)type_e,
-              len,
-              qos,
-              retained,
-              (unsigned int)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue),
-              (unsigned int)ENTITY_MQTT_AGENT_QUEUE_SIZE);
-    return OPRT_OK;
+    return Entity_Mqtt_App_Enqueue_Agent_Cmd(&cmd);
 }
 
 bool Entity_Mqtt_App_Is_Connected(void)
@@ -1076,7 +1256,7 @@ bool Entity_Mqtt_App_Is_Connected(void)
     return s_mqtt_app_connected;
 }
 
-bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
+Entity_Mqtt_Ai_Publish_Result_t Entity_Mqtt_App_Prepare_Ai_Publish_Result(void)
 {
     Entity_Mqtt_Context_t *context = &Entity_Client_Instance;
     uint32_t last_rx_age_ms = Mqtt_Client_Last_Rx_Age_Ms(context->Mqtt_Client);
@@ -1126,7 +1306,33 @@ bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
                       (unsigned int)oldest_msg_id,
                       (unsigned int)oldest_age_ms);
         }
-        return true;
+        return ENTITY_MQTT_AI_PUBLISH_READY;
+    }
+
+    if (effective == ENTITY_MQTT_EFFECTIVE_PROBING)
+    {
+        uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
+        if (s_last_ai_publish_reconnect_decision_log_ms == 0U ||
+            now_ms - s_last_ai_publish_reconnect_decision_log_ms >= 2000)
+        {
+            s_last_ai_publish_reconnect_decision_log_ms = now_ms;
+            ENTITY_LOGW("[MQTT_AI_DEFERRED][ACCEPT_PROBING] effective=%s broker_ok=%d broker=%s "
+                      "raw_ctx_connected=%d raw_app_connected=%d keepalive=%u pingresp_timeout=%u "
+                      "last_inbound_age=%u wait_ping=%d pingreq_age=%u pingresp_rtt=%u last_rx_age=%u\r\n",
+                      Entity_Mqtt_Effective_State_Str(effective),
+                      broker_ok ? 1 : 0,
+                      Mqtt_Client_Broker_Liveness_Str(broker.state),
+                      context->Is_Connected ? 1 : 0,
+                      s_mqtt_app_connected ? 1 : 0,
+                      (unsigned int)broker.keepalive_ms,
+                      (unsigned int)broker.pingresp_timeout_ms,
+                      (unsigned int)broker.last_inbound_alive_age_ms,
+                      broker.wait_ping ? 1 : 0,
+                      (unsigned int)broker.pingreq_age_ms,
+                      (unsigned int)broker.last_pingresp_rtt_ms,
+                      (unsigned int)last_rx_age_ms);
+        }
+        return ENTITY_MQTT_AI_PUBLISH_DEFERRED_PROBING;
     }
 
     bool request_reconnect = Entity_Mqtt_Effective_Should_Reconnect(effective);
@@ -1174,7 +1380,23 @@ bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
         s_mqtt_app_connected = false;
         (void)Entity_Mqtt_Force_Reconnect(context, reason);
     }
-    return false;
+    if (effective == ENTITY_MQTT_EFFECTIVE_DISCONNECTED)
+    {
+        return ENTITY_MQTT_AI_PUBLISH_BLOCKED_DISCONNECTED;
+    }
+    if (effective == ENTITY_MQTT_EFFECTIVE_DEAD)
+    {
+        return ENTITY_MQTT_AI_PUBLISH_BLOCKED_DEAD;
+    }
+    return ENTITY_MQTT_AI_PUBLISH_FAILED;
+}
+
+bool Entity_Mqtt_App_Prepare_Ai_Publish(void)
+{
+    Entity_Mqtt_Ai_Publish_Result_t result = Entity_Mqtt_App_Prepare_Ai_Publish_Result();
+
+    return result == ENTITY_MQTT_AI_PUBLISH_READY ||
+           result == ENTITY_MQTT_AI_PUBLISH_DEFERRED_PROBING;
 }
 
 bool Entity_Mqtt_App_Is_Ai_Link_Healthy(void)

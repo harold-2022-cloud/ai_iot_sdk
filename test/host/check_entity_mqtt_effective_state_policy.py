@@ -23,6 +23,7 @@ REMOVED_APP_HELPERS = (
 POLICY_FUNCTIONS = (
     "Entity_Mqtt_App_Drain_Agent_Queue",
     "Entity_Mqtt_App_Topic_Publish",
+    "Entity_Mqtt_App_Prepare_Ai_Publish_Result",
     "Entity_Mqtt_App_Prepare_Ai_Publish",
     "Entity_Mqtt_App_Is_Ai_Link_Healthy",
 )
@@ -36,10 +37,13 @@ EXPECTED_POLICY_HELPERS = {
         "Entity_Mqtt_App_Get_Effective_State",
         "Entity_Mqtt_Effective_Can_Publish",
     ),
-    "Entity_Mqtt_App_Prepare_Ai_Publish": (
+    "Entity_Mqtt_App_Prepare_Ai_Publish_Result": (
         "Entity_Mqtt_App_Get_Effective_State",
         "Entity_Mqtt_Effective_Can_Publish",
         "Entity_Mqtt_Effective_Should_Reconnect",
+    ),
+    "Entity_Mqtt_App_Prepare_Ai_Publish": (
+        "Entity_Mqtt_App_Prepare_Ai_Publish_Result",
     ),
     "Entity_Mqtt_App_Is_Ai_Link_Healthy": (
         "Entity_Mqtt_App_Get_Effective_State",

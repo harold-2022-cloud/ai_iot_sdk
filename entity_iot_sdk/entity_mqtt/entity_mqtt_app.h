@@ -46,6 +46,16 @@ typedef struct
     bool mqtt_callback_active;
 } Entity_Mqtt_App_Health_Snapshot_t;
 
+typedef enum
+{
+    ENTITY_MQTT_AI_PUBLISH_READY = 0,
+    ENTITY_MQTT_AI_PUBLISH_DEFERRED_PROBING,
+    ENTITY_MQTT_AI_PUBLISH_BLOCKED_DISCONNECTED,
+    ENTITY_MQTT_AI_PUBLISH_BLOCKED_DEAD,
+    ENTITY_MQTT_AI_PUBLISH_BLOCKED_PENDING,
+    ENTITY_MQTT_AI_PUBLISH_FAILED,
+} Entity_Mqtt_Ai_Publish_Result_t;
+
 //注册MQTT准备就绪回调
 void Register_Entity_Mqtt_App_Ready_Cb(Entity_Mqtt_App_Ready_Callback_f cb);
 
@@ -78,6 +88,7 @@ bool Entity_Mqtt_App_Is_Connected(void);
 
 //AI 请求发布前检查 MQTT RX/PUBACK 健康；必要时主动重连并返回 false
 bool Entity_Mqtt_App_Prepare_Ai_Publish(void);
+Entity_Mqtt_Ai_Publish_Result_t Entity_Mqtt_App_Prepare_Ai_Publish_Result(void);
 
 //AI token 等待期间只检查 MQTT RX/PUBACK 健康，不触发重连
 bool Entity_Mqtt_App_Is_Ai_Link_Healthy(void);

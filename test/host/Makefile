@@ -18,11 +18,11 @@ RTC_AGORA_DATASTREAM_SRCS := test_ai_rtc_agora_datastream.c ../../media/rtc_faca
 ENTITY_MQTT_EFFECTIVE_TARGET := test_entity_mqtt_effective_state
 ENTITY_MQTT_EFFECTIVE_SRCS := test_entity_mqtt_effective_state.c ../../entity_iot_sdk/entity_mqtt/entity_mqtt_effective_state.c
 
-.PHONY: all test check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers check_entity_mqtt_effective_state_policy clean
+.PHONY: all test check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers check_entity_mqtt_effective_state_policy check_entity_mqtt_ai_deferred_publish clean
 
 all: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) $(ENTITY_MQTT_EFFECTIVE_TARGET)
 
-test: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) $(ENTITY_MQTT_EFFECTIVE_TARGET) check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers check_entity_mqtt_effective_state_policy
+test: $(TARGET) $(RTC_CORE_TARGET) $(RTC_AGORA_TARGET) $(RTC_AGORA_RTM_TARGET) $(RTC_AGORA_DATASTREAM_TARGET) $(ENTITY_MQTT_EFFECTIVE_TARGET) check_entity_interface_reference_template check_ai_rtc_facade_public_header check_ai_rtc_facade_core_boundary check_ai_rtc_facade_sdk_agora_migration check_ai_rtc_control_transport_buildtime check_ai_rtc_diagnostic_markers check_entity_mqtt_effective_state_policy check_entity_mqtt_ai_deferred_publish
 	./$(TARGET)
 	./$(RTC_CORE_TARGET)
 	./$(RTC_AGORA_TARGET)
@@ -50,6 +50,9 @@ check_ai_rtc_diagnostic_markers:
 
 check_entity_mqtt_effective_state_policy:
 	python3 check_entity_mqtt_effective_state_policy.py
+
+check_entity_mqtt_ai_deferred_publish:
+	python3 check_entity_mqtt_ai_deferred_publish.py
 
 $(TARGET): $(SRCS) stubs/os/os.h stubs/os/mem.h
 	$(CC) $(CFLAGS) $(SRCS) -o $@
