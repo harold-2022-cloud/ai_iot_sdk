@@ -1170,11 +1170,9 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
                 return OPRT_COM_ERROR;
             }
 
+            /* 統一走 Entity_Mem_*：OOM 直接失敗，勿用裸 malloc 兜底
+             * （會與 Entity_Mem_Free / Bsp_Mem_Free 的 8-byte 頭跨配置器錯配）。 */
             void *deferred_copy = Entity_Mem_Malloc((unsigned int)len);
-            if (deferred_copy == NULL)
-            {
-                deferred_copy = malloc((size_t)len);
-            }
             if (deferred_copy == NULL)
             {
                 ENTITY_LOGE("[MQTT_AI_DEFERRED][STORE_FAIL] reason=alloc len=%d\r\n", len);
@@ -1216,13 +1214,10 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
         return OPRT_COM_ERROR;
     }
 
-    /* 將 data 複製到 PSRAM（Entity_Mem_Malloc），延長生命週期至 Agent Task 消費完畢 */
+    /* 複製一份，生命週期延至 Agent Task 消費完畢。統一走 Entity_Mem_*：
+     * OOM 直接失敗，勿用裸 malloc 兜底（會與 Entity_Mem_Free / Bsp_Mem_Free
+     * 的 8-byte 頭跨配置器錯配）。 */
     void *data_copy = Entity_Mem_Malloc((unsigned int)len);
-    if (data_copy == NULL)
-    {
-        /* PSRAM 分配失敗，降級到 DRAM（保留原行為） */
-        data_copy = malloc((size_t)len);
-    }
     if (data_copy == NULL)
     {
         ENTITY_LOGE("[MQTT_PUB] memory allocation failed len=%d\r\n", len);

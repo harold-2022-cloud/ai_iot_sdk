@@ -247,6 +247,57 @@ static int test_agora_backend_rejects_stop_while_joining(void)
     return 0;
 }
 
+
+static int test_agora_backend_skips_datastream_tx_without_control_peer(void)
+{
+    Test_State_t test;
+    uint8_t msg[] = "msg";
+    char rx_msg[] = "rx";
+    const Ai_Rtc_Facade_Config_t config = {
+        .join_timeout_ms = 3000,
+        .enable_audio = true,
+        .enable_video = false,
+    };
+    const Ai_Rtc_Facade_Callbacks_t callbacks = {
+        .on_state = on_state,
+        .on_datastream_rx = on_datastream_rx,
+        .user = &test,
+    };
+    const Ai_Rtc_Facade_Token_Result_t token = {
+        .result = 0,
+        .rtc_token = "token",
+        .channel_name = "channel",
+        .app_id = "appid",
+        .uid = 9,
+    };
+
+    memset(&test, 0, sizeof(test));
+    Agora_Rtc_Stub_Reset();
+    Ai_Rtc_Agora_Port_Stub_Reset();
+
+    CHECK(Ai_Rtc_Facade_Init(&config, &callbacks) == AI_RTC_FACADE_OK);
+    CHECK(Ai_Rtc_Facade_On_Token_Result(&token) == AI_RTC_FACADE_OK);
+    Agora_Rtc_Stub_Emit_Joined();
+
+    CHECK(Ai_Rtc_Facade_Is_Joined());
+    CHECK(test.joined_events == 1);
+    CHECK(Agora_Rtc_Stub_State()->create_data_stream_calls == 0);
+    CHECK(Ai_Rtc_Facade_Send_Datastream(msg, sizeof(msg)) == AI_RTC_FACADE_ERR_NOT_READY);
+    CHECK(Agora_Rtc_Stub_State()->send_stream_calls == 0);
+
+    Agora_Rtc_Stub_Emit_Stream_Message(6, 77u, rx_msg, sizeof(rx_msg), 999u);
+    CHECK(test.datastream_rx_calls == 1);
+    CHECK(test.last_message.stream_id == 6);
+    CHECK(test.last_message.sender_uid == 77u);
+    CHECK(test.last_message.data == (const uint8_t *)rx_msg);
+    CHECK(test.last_message.len == sizeof(rx_msg));
+    CHECK(test.last_message.sent_ts == 999u);
+
+    CHECK(Ai_Rtc_Facade_Stop() == AI_RTC_FACADE_OK);
+    Ai_Rtc_Facade_Deinit();
+    return 0;
+}
+
 static int test_agora_backend_flow(void)
 {
     Test_State_t test;
@@ -272,6 +323,7 @@ static int test_agora_backend_flow(void)
         .channel_name = "channel",
         .app_id = "appid",
         .uid = 9,
+        .control_peer_id = "agent-user",
     };
     const Ai_Rtc_Facade_Audio_Frame_t audio = {
         .data = audio_data,
@@ -634,6 +686,7 @@ int main(void)
     CHECK(test_private_control_transport_header_is_c_usable() == 0);
     CHECK(test_agora_backend_rejects_stop_while_joining() == 0);
     CHECK(test_agora_backend_flow() == 0);
+    CHECK(test_agora_backend_skips_datastream_tx_without_control_peer() == 0);
     CHECK(test_agora_backend_disables_audio_jitter_when_audio_disabled() == 0);
     CHECK(test_agora_backend_maps_per_session_ai_qos_option() == 0);
     CHECK(test_agora_backend_ignores_stale_callbacks() == 0);

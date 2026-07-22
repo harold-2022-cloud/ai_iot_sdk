@@ -4,6 +4,11 @@
 
 #if AI_RTC_AGORA_CONTROL_TRANSPORT == AI_RTC_AGORA_CONTROL_TRANSPORT_DATASTREAM
 
+static bool has_text(const char *value)
+{
+    return value != NULL && value[0] != '\0';
+}
+
 void Ai_Rtc_Agora_Control_Reset(Ai_Rtc_Agora_Control_State_t *state)
 {
     if (state == NULL)
@@ -35,6 +40,10 @@ int Ai_Rtc_Agora_Control_On_Rtc_Joined(Ai_Rtc_Agora_Control_State_t *state,
     if (state == NULL || conn_id == CONNECTION_ID_INVALID)
     {
         return AI_RTC_FACADE_ERR_INVALID_ARG;
+    }
+    if (!has_text(state->control_peer_id))
+    {
+        return AI_RTC_FACADE_OK;
     }
     if (state->stream_id < 0 &&
         agora_rtc_create_data_stream(conn_id, &state->stream_id, true, true) < 0)
