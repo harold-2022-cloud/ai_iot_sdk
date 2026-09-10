@@ -1,5 +1,6 @@
 //entity_mqtt_client.c
 #include <stdio.h>
+#include <string.h>
 
 #include "entity_mqtt_client.h"
 
@@ -22,6 +23,41 @@
             ENTITY_LOGI(__VA_ARGS__);     \
         }                                 \
     } while (0)
+
+#ifndef CONFIG_AIFIGURE_4G_HOT_STANDBY
+#define CONFIG_AIFIGURE_4G_HOT_STANDBY 0
+#endif
+
+#define AIFIGURE_4G_ROUTE_SWITCH_RECONNECT_SETTLE_MS 1500U
+
+#if CONFIG_AIFIGURE_4G_HOT_STANDBY
+extern void aifigure_4g_log_network_diag(const char *reason) __attribute__((weak));
+
+static void Entity_Mqtt_Aifigure_4g_Diag(const char *reason)
+{
+    if (aifigure_4g_log_network_diag != NULL)
+    {
+        aifigure_4g_log_network_diag(reason);
+    }
+}
+#else
+static void Entity_Mqtt_Aifigure_4g_Diag(const char *reason)
+{
+    (void)reason;
+}
+#endif
+
+static bool Entity_Mqtt_Aifigure_4g_Is_Route_Switch(const char *reason)
+{
+#if CONFIG_AIFIGURE_4G_HOT_STANDBY
+    return (reason != NULL) &&
+           ((strcmp(reason, "4g_ppp_got_ip_route_switch") == 0) ||
+            (strcmp(reason, "netmgr_wifi_route_switch") == 0));
+#else
+    (void)reason;
+    return false;
+#endif
+}
 
 static bool Entity_Mqtt_Client_Buffer_Contains(const char *data, int len, const char *needle)
 {
@@ -46,6 +82,12 @@ static bool Entity_Mqtt_Client_Buffer_Contains(const char *data, int len, const 
         }
     }
     return false;
+}
+
+static bool Entity_Mqtt_Client_Is_Ai_Access_Request(const char *data, int len)
+{
+    return Entity_Mqtt_Client_Buffer_Contains(data, len, "agora_agent_device_access") ||
+           Entity_Mqtt_Client_Buffer_Contains(data, len, "agora_agent_nfc_report");
 }
 
 static const char *Mqtt_Status_Str(int status)
@@ -230,6 +272,7 @@ static int Entity_Mqtt_Subscribe_Complete_Process(Entity_Mqtt_Context_t* context
 	/* 实际以自动订阅成功作为连接成功的标志 */
 	context->Is_Connected = true;
 	s_reconnect_delay_ms = 1000;    /* 連線成功，重置退避計時器 */
+	Entity_Mqtt_Aifigure_4g_Diag("mqtt_app_connected_cb");
 	if (context->Config.Connected_Cb) //此回调中可以进入相关的上报及请求
 	{
 		context->Config.Connected_Cb(context, context->User_Data);
@@ -259,6 +302,7 @@ static void Mqtt_Client_Connected_Callback(void* client_context, void* userdata)
 	          entity_mqtt_context->Is_Connected ? 1 : 0,
 	          (unsigned int)entity_mqtt_context->Last_Subscribe_Id,
 	          entity_mqtt_context->Prohibit_Connect ? 1 : 0);
+	Entity_Mqtt_Aifigure_4g_Diag("mqtt_connected_cb");
 	uint16_t sub_id1 = Mqtt_Client_Subscribe(client_context, Event_Subscribe_Topic, (uint8_t)MQTT_QOS_1);
 	ENTITY_LOGI("[MQTT_SUB] subscribe event topic: %s, msgId=%d%s\r\n",
 	          Event_Subscribe_Topic, sub_id1, sub_id1 == 0 ? " [FAILED]" : "");
@@ -290,6 +334,7 @@ static void Mqtt_Client_Disconnected_Callback(void* client_context, void* userda
 	Entity_Mqtt_Context_t* entity_mqtt_context = (Entity_Mqtt_Context_t*)userdata;
 	ENTITY_LOGI("mqtt client disconnected!\r\n");
     uint8_t prev_state = entity_mqtt_context->State;
+    Entity_Mqtt_Aifigure_4g_Diag("mqtt_disconnected_cb");
     ENTITY_LOGW("[MQTT_DIAG][DISCONNECTED_CB] state=%s is_connected_before=%d prohibit=%d last_id=%u\r\n",
               Entity_Mqtt_State_Str(prev_state),
               entity_mqtt_context->Is_Connected ? 1 : 0,
@@ -481,6 +526,7 @@ int Entity_Mqtt_Connect(Entity_Mqtt_Context_t* context)
 	context->Prohibit_Connect = false;
 	mqtt_status = Mqtt_Client_Connect(context->Mqtt_Client);
 	if (mqtt_status != MQTT_STATUS_SUCCESS) {
+		Entity_Mqtt_Aifigure_4g_Diag("mqtt_connect_api_fail");
 		ENTITY_LOGE("MQTT connect failed: Status = %d.\r\n", mqtt_status);
 		return OPRT_LINK_CORE_MQTT_CONNECT_ERROR;
 	}
@@ -516,11 +562,23 @@ int Entity_Mqtt_Force_Reconnect(Entity_Mqtt_Context_t* context, const char *reas
 	}
 
 	const char *safe_reason = (reason != NULL) ? reason : "unknown";
-	if (context->Reconnect_Pending ||
-	    context->State == ENTITY_MQTT_CONNCET_STATE)
+	bool route_switch = Entity_Mqtt_Aifigure_4g_Is_Route_Switch(safe_reason);
+	if ((context->Reconnect_Pending ||
+	     context->State == ENTITY_MQTT_CONNCET_STATE) &&
+	    !route_switch)
 	{
 		return OPRT_OK;
 	}
+	if (route_switch &&
+	    (context->Reconnect_Pending || context->State == ENTITY_MQTT_CONNCET_STATE))
+	{
+		Entity_Mqtt_Aifigure_4g_Diag("mqtt_route_switch_force_cleanup");
+		ENTITY_LOGW("[MQTT_DIAG][ROUTE_SWITCH_FORCE_CLEANUP] reason=%s pending=%d state=%s\r\n",
+		          safe_reason,
+		          context->Reconnect_Pending ? 1 : 0,
+		          Entity_Mqtt_State_Str(context->State));
+	}
+    Entity_Mqtt_Aifigure_4g_Diag("mqtt_reconnect_pending");
     Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "request", safe_reason);
 	Entity_Mqtt_Set_Reconnect_Reason(context, safe_reason);
 	context->Reconnect_Pending = true;
@@ -552,12 +610,16 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 		uint8_t prev_state = context->State;
 		uint16_t prev_last_id = context->Last_Subscribe_Id;
 		bool should_disconnect = context->Is_Connected ||
+		                         Entity_Mqtt_Aifigure_4g_Is_Route_Switch(context->Reconnect_Reason[0] ?
+		                                                                 context->Reconnect_Reason : "unknown") ||
 		                         (prev_state == ENTITY_MQTT_SUBSCRIBING_STATE) ||
 		                         (prev_state == ENTITY_MQTT_SUBSCRIBE_COMPLETE_STATE) ||
 		                         (prev_state == ENTITY_MQTT_YIELD_STATE);
 		const char *reason = context->Reconnect_Reason[0] ?
 		                     context->Reconnect_Reason : "unknown";
+        Entity_Mqtt_Aifigure_4g_Diag("mqtt_reconnect_begin");
         Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "begin", reason);
+		bool route_switch_reconnect = Entity_Mqtt_Aifigure_4g_Is_Route_Switch(reason);
 		context->State = ENTITY_MQTT_CONNCET_STATE;
 		context->Reconnect_Pending = false;
 		context->Prohibit_Connect = false;
@@ -565,12 +627,13 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 		context->Last_Subscribe_Id = 0;
 		s_sub_enter_ms = 0;
 		ENTITY_LOGW("[MQTT_DIAG][RECONNECT_BEGIN] reason=%s state=%s last_id=%u prohibit=%d "
-		          "disconnect=%d\r\n",
+		          "disconnect=%d route_switch=%d\r\n",
 		          reason,
 		          Entity_Mqtt_State_Str(prev_state),
 		          (unsigned int)prev_last_id,
 		          context->Prohibit_Connect ? 1 : 0,
-		          should_disconnect ? 1 : 0);
+		          should_disconnect ? 1 : 0,
+		          route_switch_reconnect ? 1 : 0);
 		Mqtt_Client_Status_t mqtt_status = MQTT_STATUS_SUCCESS;
 		if (should_disconnect)
 		{
@@ -581,6 +644,17 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 		          Entity_Mqtt_State_Str(context->State),
 		          (int)mqtt_status,
 		          Mqtt_Status_Str((int)mqtt_status));
+		if (route_switch_reconnect)
+		{
+			Entity_Mqtt_Aifigure_4g_Diag("mqtt_route_switch_socket_settle");
+			Entity_Mqtt_Log_Reconnect_Core_Snapshot(context, "route_switch_settle", reason);
+			ENTITY_LOGW("[MQTT_DIAG][ROUTE_SWITCH_SOCKET_SETTLE] reason=%s delay_ms=%u status=%d(%s)\r\n",
+			          reason,
+			          (unsigned int)AIFIGURE_4G_ROUTE_SWITCH_RECONNECT_SETTLE_MS,
+			          (int)mqtt_status,
+			          Mqtt_Status_Str((int)mqtt_status));
+			return (int)AIFIGURE_4G_ROUTE_SWITCH_RECONNECT_SETTLE_MS;
+		}
 		return 0;
 	}
 	switch (context->State) 
@@ -617,6 +691,7 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 			}
 			else
 			{
+				Entity_Mqtt_Aifigure_4g_Diag("mqtt_loop_connect_fail");
 				ENTITY_LOGE("[MQTT] connect failed: status=%d(%s), retry_after_ms=%u\r\n",
 				          (int)conn_ret, Mqtt_Status_Str((int)conn_ret), (unsigned int)s_reconnect_delay_ms);
 				/* 退避延遲由外層（鎖外）執行，此處只返回需等待的 ms */
@@ -648,6 +723,7 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 				/* 当检测到错误，延时再进入 ENTITY_STATE_CONNECTING 状态，避免出现连接断开又立马连上云端的问题出现；
 				因为云端对于上线下线等消息是并行处理，可能存在后上线的消息比先离线的消息以及关联处理先完成，导致设备一直处于离线的状态，实际设备在线 */
                 uint8_t prev_state = context->State;
+                Entity_Mqtt_Aifigure_4g_Diag("mqtt_sub_wait_yield_fail");
                 ENTITY_LOGW("[MQTT_DIAG][SUB_WAIT_YIELD_FAIL] status=%d(%s) state=%s "
                           "last_id=%u is_connected=%d\r\n",
                           (int)yield_ret,
@@ -672,6 +748,7 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
                  * 必須先判斷非零才能計算超時，否則收到 SUBACK 後 ProcessLoop
                  * 跑完 10s 返回時 (now - 0) >> 15000 會觸發假陽性斷線。*/
                 uint8_t prev_state = context->State;
+                Entity_Mqtt_Aifigure_4g_Diag("mqtt_sub_wait_timeout");
                 ENTITY_LOGE("[MQTT_SUB] SUBACK wait timeout over 15s, force disconnect/reconnect\r\n");
                 ENTITY_LOGE("[MQTT_DIAG][SUB_WAIT_TIMEOUT] elapsed=%u state=%s last_id=%u "
                           "is_connected=%d prohibit=%d\r\n",
@@ -708,6 +785,7 @@ int Entity_Mqtt_Loop(Entity_Mqtt_Context_t* context)
 				/*当检测到错误，延时再进入 ENTITY_STATE_CONNECTING 状态，避免出现连接断开又立马连上云端的问题出现；
 				因为云端对于上线下线等消息是并行处理，可能存在后上线的消息比先离线的消息以及关联处理先完成，导致设备一直处于离线的状态，实际设备在线 */
 				uint8_t prev_state = context->State;
+				Entity_Mqtt_Aifigure_4g_Diag("mqtt_yield_state_fail");
 				ENTITY_LOGW("[MQTT_DIAG][YIELD_STATE_FAIL] status=%d(%s) state=%s "
 				          "is_connected=%d prohibit=%d\r\n",
 				          (int)yield_ret,
@@ -837,7 +915,7 @@ int Entity_Mqtt_Topic_Publish(Entity_Mqtt_Context_t* context, Topic_Type_e type_
 
     int rc = 0;
     uint32_t begin_ms = Entity_Get_Run_Time_Ms();
-    bool ai_access = Entity_Mqtt_Client_Buffer_Contains(data, len, "agora_agent_device_access");
+    bool ai_access = Entity_Mqtt_Client_Is_Ai_Access_Request(data, len);
 	if(!Entity_Mqtt_Is_Connected(context))
 	{
 		ENTITY_LOGE("[MQTT] publish failed: reason=mqtt_not_connected state=%d\r\n", (int)context->State);

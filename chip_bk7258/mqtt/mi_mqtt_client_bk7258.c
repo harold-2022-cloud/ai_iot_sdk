@@ -25,6 +25,27 @@
 
 #define ENTITY_MQTT_PROCESS_LOOP_SLICE_MS 200U
 
+#ifndef CONFIG_AIFIGURE_4G_HOT_STANDBY
+#define CONFIG_AIFIGURE_4G_HOT_STANDBY 0
+#endif
+
+#if CONFIG_AIFIGURE_4G_HOT_STANDBY
+extern void aifigure_4g_log_network_diag(const char *reason) __attribute__((weak));
+
+static void Mi_Mqtt_Aifigure_4g_Diag(const char *reason)
+{
+    if (aifigure_4g_log_network_diag != NULL)
+    {
+        aifigure_4g_log_network_diag(reason);
+    }
+}
+#else
+static void Mi_Mqtt_Aifigure_4g_Diag(const char *reason)
+{
+    (void)reason;
+}
+#endif
+
 static bool Mi_Mqtt_Client_Buffer_Contains(const uint8_t *data, size_t len, const char *needle)
 {
     size_t needle_len;
@@ -319,6 +340,7 @@ Mqtt_Client_Status_t Mqtt_Client_Connect(void* client_context)
     int ret = context->Network.Connect(&context->Network, &context->Config.Tcp_Connect_Params, NULL);
     if (0 != ret)
     {
+        Mi_Mqtt_Aifigure_4g_Diag("mqtt_network_connect_fail");
         return MQTT_STATUS_NETWORK_CONNECT_FAILED;
     }
     bool pSessionPresent = false;
@@ -344,6 +366,7 @@ Mqtt_Client_Status_t Mqtt_Client_Connect(void* client_context)
     Bsp_Mutex_Unlock(&context->Mqtt_Context.mutex);
     if (MQTTSuccess != mqtt_status) // MQTT 连接失败
     {
+        Mi_Mqtt_Aifigure_4g_Diag("mqtt_connect_packet_fail");
         LogError( ("mqtt connect err:  %s(%d)", MQTT_Status_strerror(mqtt_status), mqtt_status) );
         context->Network.Disconnect(&context->Network); // 断开网络连接
         if (MQTTNotAuthorized == mqtt_status) // 未授权错误
@@ -525,6 +548,7 @@ Mqtt_Client_Status_t Mqtt_Client_Yield(void* client_context)
     Mqtt_Client_Context_t* context = (Mqtt_Client_Context_t*)client_context;
     MQTTStatus_t mqtt_status;
     static uint32_t s_last_probing_diag_ms = 0U;
+    static uint32_t s_last_success_diag_ms = 0U;
     uint32_t process_loop_timeout_ms = context->Config.Tcp_Connect_Params.Timeout_Ms;
     uint32_t now_ms = context->Mqtt_Context.getTime ? context->Mqtt_Context.getTime() : 0U;
     if (process_loop_timeout_ms > ENTITY_MQTT_PROCESS_LOOP_SLICE_MS)
@@ -541,12 +565,14 @@ Mqtt_Client_Status_t Mqtt_Client_Yield(void* client_context)
     if( mqtt_status != MQTTSuccess )
     {
         uint32_t ping_age_ms = 0U;
+        s_last_success_diag_ms = 0U;
         now_ms = context->Mqtt_Context.getTime ? context->Mqtt_Context.getTime() : now_ms;
         if (context->Mqtt_Context.waitingForPingResp &&
             now_ms >= context->Mqtt_Context.pingReqSendTimeMs)
         {
             ping_age_ms = now_ms - context->Mqtt_Context.pingReqSendTimeMs;
         }
+        Mi_Mqtt_Aifigure_4g_Diag("mqtt_process_loop_status");
         ENTITY_LOGW("[MQTT_LOOP_DIAG][PROCESS_LOOP_STATUS] return_status=%s(%d) "
                     "mapped_status=%d slice_ms=%u wait_ping=%d ping_age=%u "
                     "ping_sent=%u last_packet=%u ping_rtt=%u last_rx=%u connected=%d\r\n",
@@ -587,6 +613,21 @@ Mqtt_Client_Status_t Mqtt_Client_Yield(void* client_context)
     else
     {
         s_last_probing_diag_ms = 0U;
+    }
+    now_ms = context->Mqtt_Context.getTime ? context->Mqtt_Context.getTime() : now_ms;
+    if ((s_last_success_diag_ms == 0U) ||
+        (now_ms - s_last_success_diag_ms >= 30000U))
+    {
+        s_last_success_diag_ms = now_ms;
+        Mi_Mqtt_Aifigure_4g_Diag("mqtt_process_loop_ok");
+        LogInfo(("[MQTT_LOOP_DIAG][PROCESS_LOOP_OK] slice_ms=%u wait_ping=%d "
+                 "last_packet=%u ping_rtt=%u last_rx=%u connected=%d",
+                 (unsigned int)process_loop_timeout_ms,
+                 context->Mqtt_Context.waitingForPingResp ? 1 : 0,
+                 (unsigned int)context->Mqtt_Context.lastPacketTime,
+                 (unsigned int)context->Mqtt_Context.ping_rtt_ms,
+                 (unsigned int)context->Last_Rx_Ms,
+                 context->Mqtt_Context.connectStatus == MQTTConnected ? 1 : 0));
     }
     return MQTT_STATUS_SUCCESS;
 }

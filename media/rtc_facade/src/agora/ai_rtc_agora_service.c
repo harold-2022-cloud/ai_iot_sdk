@@ -11,6 +11,7 @@
 #define AI_RTC_AGORA_SERVICE_MAX_APP_ID_LEN 64u
 #define AI_RTC_AGORA_SERVICE_PCM_DURATION_MS 20
 #define AI_RTC_AGORA_JOIN_WAIT_POLL_MS 10u
+#define AI_RTC_AGORA_CONNECTION_LOST_GRACE_MS 8000u
 
 #define AI_RTC_AGORA_LOG(...)      \
     do                             \
@@ -36,14 +37,21 @@ typedef struct
     volatile bool session_active;
     volatile bool joined;
     volatile bool remote_user_joined;
+    volatile bool remote_user_joined_before_reconnect;
     connection_id_t conn_id;
     Ai_Rtc_Agora_Session_Phase_t phase;
     Ai_Rtc_Agora_Control_State_t control_state;
     uint32_t generation;
     uint32_t stale_callbacks;
     uint32_t audio_not_ready_logs;
+    uint32_t audio_send_fail_logs;
+    uint32_t audio_send_fail_count;
+    int last_audio_send_rc;
     uint32_t datastream_not_ready_logs;
     char app_id[AI_RTC_AGORA_SERVICE_MAX_APP_ID_LEN + 1u];
+    bool connection_lost_deferred;
+    uint32_t connection_lost_deferred_at_ms;
+    uint32_t connection_lost_deferred_generation;
     const Ai_Rtc_Agora_Port_t *port;
 } Ai_Rtc_Agora_Service_Context_t;
 
@@ -161,6 +169,73 @@ static bool service_should_log_counter(uint32_t *counter)
     return value < 8u || (value % 100u) == 0u;
 }
 
+static uint32_t service_now_ms(void)
+{
+    const Ai_Rtc_Agora_Port_t *port = s_agora.port;
+
+    if (port == NULL)
+    {
+        port = Ai_Rtc_Agora_Port_Get();
+    }
+    if (port != NULL && port->timestamp_ms != NULL)
+    {
+        return port->timestamp_ms();
+    }
+    return 0u;
+}
+
+static void service_clear_connection_lost_deferred(void)
+{
+    s_agora.connection_lost_deferred = false;
+    s_agora.connection_lost_deferred_at_ms = 0u;
+    s_agora.connection_lost_deferred_generation = 0u;
+}
+
+static bool service_snapshot_remote_before_reconnect(void)
+{
+    const bool remote_snapshot =
+        s_agora.remote_user_joined || s_agora.remote_user_joined_before_reconnect;
+    s_agora.remote_user_joined_before_reconnect = remote_snapshot;
+    s_agora.remote_user_joined = false;
+    return remote_snapshot;
+}
+
+static bool service_connection_lost_can_defer(void)
+{
+    return s_agora.session_active &&
+           (s_agora.phase == AI_RTC_AGORA_SESSION_JOINING ||
+            s_agora.phase == AI_RTC_AGORA_SESSION_RECONNECTING);
+}
+
+static bool service_connection_lost_deferred_expired(uint32_t waited_ms)
+{
+    uint32_t now_ms;
+
+    if (!s_agora.connection_lost_deferred)
+    {
+        return false;
+    }
+    now_ms = service_now_ms();
+    if (now_ms != 0u && s_agora.connection_lost_deferred_at_ms != 0u)
+    {
+        return (uint32_t)(now_ms - s_agora.connection_lost_deferred_at_ms) >=
+               AI_RTC_AGORA_CONNECTION_LOST_GRACE_MS;
+    }
+    return waited_ms >= AI_RTC_AGORA_CONNECTION_LOST_GRACE_MS;
+}
+
+static int service_fail_connection_lost_deferred_timeout(void)
+{
+    AI_RTC_AGORA_LOG("connection_lost deferred timeout gen=%lu grace_ms=%lu phase=%d",
+                     (unsigned long)s_agora.connection_lost_deferred_generation,
+                     (unsigned long)AI_RTC_AGORA_CONNECTION_LOST_GRACE_MS,
+                     (int)s_agora.phase);
+    service_clear_connection_lost_deferred();
+    s_agora.phase = AI_RTC_AGORA_SESSION_FAILED;
+    Ai_Rtc_Facade_Backend_Notify_Failed(ERR_NET_DOWN);
+    return AI_RTC_FACADE_ERR_NOT_READY;
+}
+
 static void on_port_network_event(Ai_Rtc_Agora_Port_Network_Event_t event, void *user)
 {
     (void)user;
@@ -223,11 +298,16 @@ static void service_reset_session_state(void)
     s_agora.session_active = false;
     s_agora.joined = false;
     s_agora.remote_user_joined = false;
+    s_agora.remote_user_joined_before_reconnect = false;
     s_agora.conn_id = CONNECTION_ID_INVALID;
     s_agora.phase = AI_RTC_AGORA_SESSION_IDLE;
     s_agora.stale_callbacks = 0u;
     s_agora.audio_not_ready_logs = 0u;
+    s_agora.audio_send_fail_logs = 0u;
+    s_agora.audio_send_fail_count = 0u;
+    s_agora.last_audio_send_rc = 0;
     s_agora.datastream_not_ready_logs = 0u;
+    service_clear_connection_lost_deferred();
     (void)Ai_Rtc_Agora_Control_Stop(&s_agora.control_state);
     Ai_Rtc_Agora_Datastream_Reset();
 }
@@ -248,6 +328,7 @@ static int service_stop_session(void)
     s_agora.session_active = false;
     s_agora.joined = false;
     s_agora.remote_user_joined = false;
+    s_agora.remote_user_joined_before_reconnect = false;
     if (conn_id != CONNECTION_ID_INVALID)
     {
         s_agora.phase = AI_RTC_AGORA_SESSION_LEAVING;
@@ -293,6 +374,8 @@ static void on_error(connection_id_t conn_id, int code, const char *msg)
     }
     AI_RTC_AGORA_LOG("callback error conn=%d code=%d", (int)conn_id, code);
     s_agora.phase = AI_RTC_AGORA_SESSION_FAILED;
+    service_clear_connection_lost_deferred();
+    s_agora.remote_user_joined_before_reconnect = false;
     Ai_Rtc_Facade_Backend_Notify_Failed(code);
 }
 
@@ -306,6 +389,8 @@ static void on_join_channel_success(connection_id_t conn_id, uint32_t uid, int e
     s_agora.conn_id = conn_id;
     s_agora.joined = true;
     s_agora.phase = AI_RTC_AGORA_SESSION_JOINED;
+    s_agora.remote_user_joined_before_reconnect = false;
+    service_clear_connection_lost_deferred();
     AI_RTC_AGORA_LOG("callback joined conn=%d uid=%lu elapsed_ms=%d gen=%lu",
                      (int)conn_id,
                      (unsigned long)uid,
@@ -321,12 +406,13 @@ static void on_reconnecting(connection_id_t conn_id)
     {
         return;
     }
+    const bool remote_snapshot = service_snapshot_remote_before_reconnect();
     s_agora.joined = false;
-    s_agora.remote_user_joined = false;
     s_agora.phase = AI_RTC_AGORA_SESSION_RECONNECTING;
-    AI_RTC_AGORA_LOG("callback reconnecting conn=%d gen=%lu",
+    AI_RTC_AGORA_LOG("callback reconnecting conn=%d gen=%lu remote_snapshot=%d",
                      (int)conn_id,
-                     (unsigned long)s_agora.generation);
+                     (unsigned long)s_agora.generation,
+                     remote_snapshot ? 1 : 0);
     Ai_Rtc_Facade_Backend_Notify_Reconnecting(0);
 }
 
@@ -336,12 +422,28 @@ static void on_connection_lost(connection_id_t conn_id)
     {
         return;
     }
+    const bool remote_snapshot = service_snapshot_remote_before_reconnect();
     s_agora.joined = false;
-    s_agora.remote_user_joined = false;
+    if (service_connection_lost_can_defer())
+    {
+        s_agora.phase = AI_RTC_AGORA_SESSION_RECONNECTING;
+        s_agora.connection_lost_deferred = true;
+        s_agora.connection_lost_deferred_at_ms = service_now_ms();
+        s_agora.connection_lost_deferred_generation = s_agora.generation;
+        AI_RTC_AGORA_LOG("callback connection_lost deferred conn=%d gen=%lu grace_ms=%lu remote_snapshot=%d",
+                         (int)conn_id,
+                         (unsigned long)s_agora.generation,
+                         (unsigned long)AI_RTC_AGORA_CONNECTION_LOST_GRACE_MS,
+                         remote_snapshot ? 1 : 0);
+        Ai_Rtc_Facade_Backend_Notify_Reconnecting(0);
+        return;
+    }
     s_agora.phase = AI_RTC_AGORA_SESSION_FAILED;
-    AI_RTC_AGORA_LOG("callback connection_lost conn=%d gen=%lu",
+    s_agora.remote_user_joined_before_reconnect = false;
+    AI_RTC_AGORA_LOG("callback connection_lost conn=%d gen=%lu remote_snapshot=%d",
                      (int)conn_id,
-                     (unsigned long)s_agora.generation);
+                     (unsigned long)s_agora.generation,
+                     remote_snapshot ? 1 : 0);
     Ai_Rtc_Facade_Backend_Notify_Failed(ERR_NET_DOWN);
 }
 
@@ -352,15 +454,19 @@ static void on_rejoin_channel_success(connection_id_t conn_id, uint32_t uid, int
     {
         return;
     }
+    const bool restore_remote = s_agora.remote_user_joined_before_reconnect;
     s_agora.conn_id = conn_id;
     s_agora.joined = true;
-    s_agora.remote_user_joined = false;
+    s_agora.remote_user_joined = restore_remote;
+    s_agora.remote_user_joined_before_reconnect = false;
     s_agora.phase = AI_RTC_AGORA_SESSION_JOINED;
-    AI_RTC_AGORA_LOG("callback rejoined conn=%d uid=%lu elapsed_ms=%d gen=%lu",
+    service_clear_connection_lost_deferred();
+    AI_RTC_AGORA_LOG("callback rejoined conn=%d uid=%lu elapsed_ms=%d gen=%lu remote_restore=%d",
                      (int)conn_id,
                      (unsigned long)uid,
                      elapsed_ms,
-                     (unsigned long)s_agora.generation);
+                     (unsigned long)s_agora.generation,
+                     restore_remote ? 1 : 0);
     (void)Ai_Rtc_Agora_Control_On_Rtc_Joined(&s_agora.control_state, conn_id);
     Ai_Rtc_Facade_Backend_Notify_Rejoined(elapsed_ms);
 }
@@ -386,6 +492,7 @@ static void on_user_joined(connection_id_t conn_id, uint32_t uid, int elapsed_ms
         return;
     }
     s_agora.remote_user_joined = true;
+    s_agora.remote_user_joined_before_reconnect = false;
     AI_RTC_AGORA_LOG("callback remote_user_joined conn=%d uid=%lu gen=%lu",
                      (int)conn_id,
                      (unsigned long)uid,
@@ -401,6 +508,7 @@ static void on_user_offline(connection_id_t conn_id, uint32_t uid, int reason)
         return;
     }
     s_agora.remote_user_joined = false;
+    s_agora.remote_user_joined_before_reconnect = false;
     AI_RTC_AGORA_LOG("callback remote_user_offline conn=%d uid=%lu reason=%d gen=%lu",
                      (int)conn_id,
                      (unsigned long)uid,
@@ -576,11 +684,16 @@ int Ai_Rtc_Agora_Service_Start(const Ai_Rtc_Facade_Backend_Start_Config_t *confi
     s_agora.session_active = false;
     s_agora.joined = false;
     s_agora.remote_user_joined = false;
+    s_agora.remote_user_joined_before_reconnect = false;
     s_agora.conn_id = CONNECTION_ID_INVALID;
     s_agora.phase = AI_RTC_AGORA_SESSION_IDLE;
     s_agora.stale_callbacks = 0u;
     s_agora.audio_not_ready_logs = 0u;
+    s_agora.audio_send_fail_logs = 0u;
+    s_agora.audio_send_fail_count = 0u;
+    s_agora.last_audio_send_rc = 0;
     s_agora.datastream_not_ready_logs = 0u;
+    service_clear_connection_lost_deferred();
     Ai_Rtc_Agora_Control_Reset(&s_agora.control_state);
 
     rc = agora_rtc_create_connection(&s_agora.conn_id);
@@ -734,6 +847,10 @@ int Ai_Rtc_Agora_Service_Wait_Joined(uint32_t timeout_ms)
                                ? remaining_ms
                                : AI_RTC_AGORA_JOIN_WAIT_POLL_MS;
 
+        if (service_connection_lost_deferred_expired(waited_ms))
+        {
+            return service_fail_connection_lost_deferred_timeout();
+        }
         port->sleep_ms(step_ms);
         if (has_timestamp)
         {
@@ -742,6 +859,10 @@ int Ai_Rtc_Agora_Service_Wait_Joined(uint32_t timeout_ms)
         else
         {
             waited_ms += step_ms;
+        }
+        if (service_connection_lost_deferred_expired(waited_ms))
+        {
+            return service_fail_connection_lost_deferred_timeout();
         }
     }
 
@@ -755,6 +876,7 @@ int Ai_Rtc_Agora_Service_Send_Audio(const Ai_Rtc_Facade_Audio_Frame_t *frame)
     const bool remote_user_joined = s_agora.remote_user_joined;
     const connection_id_t conn_id = s_agora.conn_id;
     audio_frame_info_t info;
+    int rc;
 
     if (frame == NULL || frame->data == NULL || frame->len == 0u)
     {
@@ -776,9 +898,29 @@ int Ai_Rtc_Agora_Service_Send_Audio(const Ai_Rtc_Facade_Audio_Frame_t *frame)
 
     memset(&info, 0, sizeof(info));
     info.data_type = map_facade_audio_format(frame->format);
-    return (agora_rtc_send_audio_data(conn_id, frame->data, frame->len, &info) < 0)
-        ? AI_RTC_FACADE_ERR_INTERNAL
-        : AI_RTC_FACADE_OK;
+    rc = agora_rtc_send_audio_data(conn_id, frame->data, frame->len, &info);
+    s_agora.last_audio_send_rc = rc;
+    if (rc < 0)
+    {
+        s_agora.audio_send_fail_count++;
+        if (service_should_log_counter(&s_agora.audio_send_fail_logs))
+        {
+            AI_RTC_AGORA_LOG("send_audio failed rc=%d active=%d joined=%d remote_user_joined=%d conn=%d gen=%lu phase=%d len=%lu type=%d fail_count=%lu",
+                             rc,
+                             active ? 1 : 0,
+                             joined ? 1 : 0,
+                             remote_user_joined ? 1 : 0,
+                             (int)conn_id,
+                             (unsigned long)s_agora.generation,
+                             (int)s_agora.phase,
+                             (unsigned long)frame->len,
+                             (int)info.data_type,
+                             (unsigned long)s_agora.audio_send_fail_count);
+        }
+        return AI_RTC_FACADE_ERR_INTERNAL;
+    }
+
+    return AI_RTC_FACADE_OK;
 }
 
 int Ai_Rtc_Agora_Service_Send_Video(const Ai_Rtc_Facade_Video_Frame_t *frame)

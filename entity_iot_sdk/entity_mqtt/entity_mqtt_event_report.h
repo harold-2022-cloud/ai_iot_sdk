@@ -93,7 +93,7 @@ void Entity_Mqtt_Event_Find_Report(const char *uuid, const char *pid, unsigned c
 void Entity_Mqtt_Event_Ipc_Live_Get_Request(Ipc_Push_Type_e type, unsigned char ack);
 
 //事件上报-nfcid上报
-void Mqtt_Event_Agora_Agent_Nfc_Report(const char *nfcIdentifier, int ack,int onlyReport);
+int Mqtt_Event_Agora_Agent_Nfc_Report(const char *nfcIdentifier, int ack,int onlyReport);
 
 //事件上报-停止rtc会话
 void Mqtt_Event_Agora_Rtc_Stop_Report(const char *channelName, int ack);
@@ -101,7 +101,7 @@ void Mqtt_Event_Agora_Rtc_Stop_Report(const char *channelName, int ack);
 //事件上报-无NFC的设备请求声网访问信息
 // persona_id: 当前选中的 AI 角色 ID，非空时写入 data.llmExtraParams.personaId
 // language: 当前会话语言，非空时写入 data.llmExtraParams.language
-void Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id, const char *language);
+int Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id, const char *language);
 
 /* 返回最近一次 agora_agent_device_access pub 的單調時間戳（ms），用於計算 pub→sub RTT */
 uint64_t Entity_Mqtt_Get_Token_Pub_Ms(void);

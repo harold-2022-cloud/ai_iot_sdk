@@ -11,6 +11,7 @@
 #include "entity_wifi.h"
 #include "entity_iot_func.h"
 #include "entity_dev_info.h"
+#include "entity_error_code.h"
 
 #include "com_utils.h"
 #include "ai_dialog_diag.h"
@@ -39,17 +40,20 @@
 *@返回值 	void
 *@使用说明	将cjson转成无模式字符串后发布
 */
-static void Entity_Mqtt_Event_Publish(cJSON *root, Mqtt_Qos_Type_e qos, int retain)
+static int Entity_Mqtt_Event_Publish(cJSON *root, Mqtt_Qos_Type_e qos, int retain)
 {
     char *json = cJSON_PrintUnformatted(root);
     if (json)
     {
+        int ret;
         AI_HOTPATH_VERBOSE_DO(
             ENTITY_LOGD("publish json:%s", json);
         );
-        Entity_Mqtt_App_Topic_Publish(TOPIC_TYPE_EVENT_PUBLISH, json, strlen(json), qos, retain);
+        ret = Entity_Mqtt_App_Topic_Publish(TOPIC_TYPE_EVENT_PUBLISH, json, strlen(json), qos, retain);
         cJSON_free(json);
+        return ret;
     }
+    return OPRT_COM_ERROR;
 }
 
 /**
@@ -809,6 +813,10 @@ quit:
     cJSON_Delete(root);
 }
 
+static uint64_t s_token_pub_ms = 0;
+static char s_token_pub_id[32] = {0};
+static Entity_Critical_t s_token_pending_mux = NULL;
+
 /**
 *@名称 		Mqtt_Event_Agora_Agent_Nfc_Report
 *@功能 		事件上报-nfcid上报
@@ -818,20 +826,63 @@ quit:
 *@返回值 	void
 *@使用说明	
 */
-void Mqtt_Event_Agora_Agent_Nfc_Report(const char *nfcIdentifier, int ack,int onlyReport)
+int Mqtt_Event_Agora_Agent_Nfc_Report(const char *nfcIdentifier, int ack,int onlyReport)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON *data = cJSON_CreateObject();
     char *msgId = Random_MsgId();
+    uint64_t pub_ms = 0;
+    int ret = OPRT_COM_ERROR;
+    bool token_pending_set = false;
     Custom_Assert_Check_RequireString_Goto((root && data && msgId), quit, "cJSON_CreateObject error");
     Entity_Mqtt_Event_Report_Load_Base(root, msgId, ack, ENTITY_EVENT_AGORA_AGENT_NFC_REPORT_CODE);
     cJSON_AddStringToObject(data,"nfcIdentifier",nfcIdentifier);
     cJSON_AddNumberToObject(data,"onlyReport",onlyReport);
     cJSON_AddItemToObject(root, "data", data);
-    Entity_Mqtt_Event_Publish(root, QOS1_LEAST_ONCE, 0);
+    data = NULL;
+    if (ack != 0 && onlyReport == 0)
+    {
+        pub_ms = Entity_Get_Uptime_Ms();
+        Entity_Critical_Enter(&s_token_pending_mux);
+        s_token_pub_ms = pub_ms;
+        {
+            size_t copy_len = strnlen(msgId, sizeof(s_token_pub_id) - 1U);
+            memcpy(s_token_pub_id, msgId, copy_len);
+            s_token_pub_id[copy_len] = '\0';
+        }
+        Entity_Critical_Exit(&s_token_pending_mux);
+        token_pending_set = true;
+        ENTITY_LOGI("[AI_TOKEN_TXN] source=nfc event=publish msgId=%s qos=%d ack=%d onlyReport=%d pub_ms=%" PRIu64 "\r\n",
+                    msgId,
+                    QOS1_LEAST_ONCE,
+                    ack,
+                    onlyReport,
+                    pub_ms);
+    }
+    ret = Entity_Mqtt_Event_Publish(root, QOS1_LEAST_ONCE, 0);
+    if (ret != OPRT_OK && token_pending_set)
+    {
+        Entity_Mqtt_Clear_Token_Pending(NULL);
+        token_pending_set = false;
+        ENTITY_LOGW("[AI_TOKEN_TXN] source=nfc result=PUBLISH_FAIL msgId=%s ret=%d\r\n",
+                    msgId,
+                    ret);
+    }
+    else if (token_pending_set)
+    {
+        ENTITY_LOGI("[AI_TOKEN_TXN] source=nfc result=SUBMITTED msgId=%s ret=%d\r\n",
+                    msgId,
+                    ret);
+    }
 quit:
+    if (ret != OPRT_OK && token_pending_set)
+    {
+        Entity_Mqtt_Clear_Token_Pending(NULL);
+    }
+    cJSON_Delete(data);
     FREE_MEMORY(msgId);
     cJSON_Delete(root);
+    return ret;
 }
 /**
 *@名称 		Mqtt_Event_Agora_Rtc_Stop_Report
@@ -865,10 +916,6 @@ quit:
 *@返回值 	void
 *@使用说明
 */
-static uint64_t s_token_pub_ms = 0;
-static char s_token_pub_id[32] = {0};
-static Entity_Critical_t s_token_pending_mux = NULL;
-
 /* @brief 一次性初始化 token-pending 临界区（幂等，避免重复建立泄漏） */
 void Entity_Mqtt_Event_Report_Init(void)
 {
@@ -976,7 +1023,7 @@ void Entity_Mqtt_Clear_Token_Pending(const char *response_id)
     Entity_Critical_Exit(&s_token_pending_mux);
 }
 
-void Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id, const char *language)
+int Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id, const char *language)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON *data = cJSON_CreateObject();
@@ -984,6 +1031,8 @@ void Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id
     bool has_persona = (persona_id != NULL && persona_id[0] != '\0');
     bool has_language = (language != NULL && language[0] != '\0');
     uint64_t pub_ms = 0;
+    int ret = OPRT_COM_ERROR;
+    bool token_pending_set = false;
     Custom_Assert_Check_RequireString_Goto((root && data && msgId), quit, "cJSON_CreateObject error");
     pub_ms = Entity_Get_Uptime_Ms();
     Entity_Critical_Enter(&s_token_pending_mux);
@@ -994,6 +1043,7 @@ void Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id
         s_token_pub_id[copy_len] = '\0';
     }
     Entity_Critical_Exit(&s_token_pending_mux);
+    token_pending_set = true;
     AI_DIALOG_DIAG_LOGI("ENTITY_MQTT", "token_publish_payload",
                         "msgId=%s qos=%d ack=%d persona=%s language=%s pub_mono=%" PRIu64 "ms",
                         msgId,
@@ -1068,12 +1118,23 @@ void Mqtt_Event_Agora_Agent_Device_Access_Report(int ack, const char *persona_id
         ENTITY_LOGW("[RTC_TOKEN][QOS0_DIAG] agora_agent_device_access temporarily uses QoS0 to verify whether PUBACK/outbox affects token response\r\n");
     );
     Ai_Dialog_Timing_Mark_Publish();
-    Entity_Mqtt_Event_Publish(root, ENTITY_AGORA_DEVICE_ACCESS_QOS, 0);
+    ret = Entity_Mqtt_Event_Publish(root, ENTITY_AGORA_DEVICE_ACCESS_QOS, 0);
+    if (ret != OPRT_OK)
+    {
+        Entity_Mqtt_Clear_Token_Pending(NULL);
+        token_pending_set = false;
+        ENTITY_LOGW("[RTC_TOKEN] agora_agent_device_access MQTT publish failed ret=%d\r\n", ret);
+    }
     AI_HOTPATH_VERBOSE_DO(
-        ENTITY_LOGI("[RTC_TOKEN] agora_agent_device_access MQTT request published qos=%d\r\n", ENTITY_AGORA_DEVICE_ACCESS_QOS);
+        ENTITY_LOGI("[RTC_TOKEN] agora_agent_device_access MQTT request published qos=%d ret=%d\r\n", ENTITY_AGORA_DEVICE_ACCESS_QOS, ret);
     );
 quit:
+    if (ret != OPRT_OK && token_pending_set)
+    {
+        Entity_Mqtt_Clear_Token_Pending(NULL);
+    }
     cJSON_Delete(data);
     FREE_MEMORY(msgId);
     cJSON_Delete(root);
+    return ret;
 }

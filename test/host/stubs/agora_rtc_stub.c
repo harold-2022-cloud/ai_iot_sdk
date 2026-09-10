@@ -127,15 +127,16 @@ int agora_rtc_send_audio_data(connection_id_t conn_id,
                               size_t data_len,
                               audio_frame_info_t *info_ptr)
 {
-    (void)conn_id;
     s_stub.send_audio_calls++;
+    s_stub.last_send_audio_conn_id = conn_id;
+    s_stub.last_send_audio_result = s_stub.send_audio_result;
     s_stub.last_audio_data = data_ptr;
     s_stub.last_audio_len = data_len;
     if (info_ptr != NULL)
     {
         s_stub.last_audio_type = info_ptr->data_type;
     }
-    return 0;
+    return s_stub.send_audio_result;
 }
 
 int agora_rtc_send_video_data(connection_id_t conn_id,

@@ -223,6 +223,8 @@ typedef struct
     int join_channel_with_user_account_calls;
     int create_data_stream_calls;
     int send_audio_calls;
+    int send_audio_result;
+    int last_send_audio_result;
     int send_video_calls;
     int send_stream_calls;
     int login_rtm_calls;
@@ -258,6 +260,7 @@ typedef struct
     int last_pcm_channel_num;
     int last_pcm_duration;
     network_event_e last_network_event;
+    connection_id_t last_send_audio_conn_id;
     audio_data_type_e last_audio_type;
     const void *last_audio_data;
     size_t last_audio_len;

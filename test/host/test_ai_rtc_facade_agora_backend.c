@@ -399,6 +399,12 @@ static int test_agora_backend_flow(void)
     CHECK(test.last_detail == 66);
     CHECK(Ai_Rtc_Facade_Send_Audio(&audio) == AI_RTC_FACADE_OK);
     CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 1);
+    Agora_Rtc_Stub_State()->send_audio_result = -1234;
+    CHECK(Ai_Rtc_Facade_Send_Audio(&audio) == AI_RTC_FACADE_ERR_INTERNAL);
+    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 2);
+    CHECK(Agora_Rtc_Stub_State()->last_send_audio_result == -1234);
+    CHECK(Agora_Rtc_Stub_State()->last_send_audio_conn_id == Agora_Rtc_Stub_State()->conn_id);
+    Agora_Rtc_Stub_State()->send_audio_result = 0;
 
     Agora_Rtc_Stub_Emit_Reconnecting();
     CHECK(test.reconnecting_events == 1);
@@ -409,17 +415,17 @@ static int test_agora_backend_flow(void)
     CHECK(test.rejoined_events == 1);
     CHECK(Ai_Rtc_Facade_Is_Joined());
 
-    CHECK(Ai_Rtc_Facade_Send_Audio(&audio) == AI_RTC_FACADE_ERR_NOT_READY);
-    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 1);
+    CHECK(Ai_Rtc_Facade_Send_Audio(&audio) == AI_RTC_FACADE_OK);
+    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 3);
     Agora_Rtc_Stub_Emit_User_Joined(66u);
     CHECK(test.remote_joined_events == 2);
     CHECK(Ai_Rtc_Facade_Send_Audio(&audio) == AI_RTC_FACADE_OK);
-    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 2);
+    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 4);
     Agora_Rtc_Stub_Emit_User_Offline(66u);
     CHECK(test.remote_offline_events == 1);
     CHECK(test.last_detail == 66);
     CHECK(Ai_Rtc_Facade_Send_Audio(&audio) == AI_RTC_FACADE_ERR_NOT_READY);
-    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 2);
+    CHECK(Agora_Rtc_Stub_State()->send_audio_calls == 4);
     CHECK(Agora_Rtc_Stub_State()->last_audio_data == audio_data);
     CHECK(Agora_Rtc_Stub_State()->last_audio_len == sizeof(audio_data));
     CHECK(Agora_Rtc_Stub_State()->last_audio_type == AUDIO_DATA_TYPE_G722);

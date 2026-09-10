@@ -298,10 +298,40 @@ void Entity_Mqtt_Event_Respone_Bind_Process(const cJSON *root)
 */
 void Entity_Mqtt_Event_Respone_Agora_Agent_Nfc_Process(cJSON *root)
 {
+    cJSON *response_id = cJSON_GetObjectItem(root, "id");
+    const char *response_id_str = cJSON_IsString(response_id) ? response_id->valuestring : NULL;
+    char pending_id[32] = {0};
+    uint64_t pending_pub_ms = 0;
+    uint64_t now_ms = Entity_Get_Uptime_Ms();
+    bool had_pending = Entity_Mqtt_Get_Token_Pending_Snapshot(pending_id,
+                                                              sizeof(pending_id),
+                                                              &pending_pub_ms);
+    uint64_t age_ms = (had_pending && now_ms >= pending_pub_ms) ?
+                      (now_ms - pending_pub_ms) : 0ULL;
+
+    if (!had_pending || !Entity_Mqtt_Is_Token_Response_Current(response_id_str))
+    {
+        ENTITY_LOGW("[AI_TOKEN_TXN] source=nfc result=STALE_OR_LATE_RESPONSE response_id=%s pending=%d pending_id=%s age_ms=%" PRIu64 "\r\n",
+                    response_id_str ? response_id_str : "(null)",
+                    had_pending ? 1 : 0,
+                    pending_id[0] ? pending_id : "(none)",
+                    age_ms);
+        return;
+    }
+
     cJSON *res = cJSON_GetObjectItem(root,"res");
     if(!cJSON_IsNumber(res) || res->valueint!=0)//nfc上报后，云端失败了
     {
         ENTITY_LOGD("error code:%d\r\n", res ? res->valueint : -1);
+        ENTITY_LOGW("[AI_TOKEN_TXN] source=nfc result=FAIL reason=cloud_res response_id=%s pending=%d age_ms=%" PRIu64 " res=%d\r\n",
+                    response_id_str ? response_id_str : "(null)",
+                    had_pending ? 1 : 0,
+                    age_ms,
+                    res ? res->valueint : -1);
+        if (had_pending)
+        {
+            Entity_Mqtt_Clear_Token_Pending(response_id_str);
+        }
         if(Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb)
             Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb(-1, NULL, NULL, NULL, 0);
         return ;
@@ -309,6 +339,14 @@ void Entity_Mqtt_Event_Respone_Agora_Agent_Nfc_Process(cJSON *root)
     cJSON *data = cJSON_GetObjectItem(root, "data");
     if(!cJSON_IsObject(data)){
         ENTITY_LOGD("data is null\r\n");
+        ENTITY_LOGW("[AI_TOKEN_TXN] source=nfc result=FAIL reason=data_null response_id=%s pending=%d age_ms=%" PRIu64 "\r\n",
+                    response_id_str ? response_id_str : "(null)",
+                    had_pending ? 1 : 0,
+                    age_ms);
+        if (had_pending)
+        {
+            Entity_Mqtt_Clear_Token_Pending(response_id_str);
+        }
         if(Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb)
             Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb(-1, NULL, NULL, NULL, 0);
         return;
@@ -320,6 +358,18 @@ void Entity_Mqtt_Event_Respone_Agora_Agent_Nfc_Process(cJSON *root)
     if(!cJSON_IsString(cjson_rtcToken) || !cJSON_IsString(cjson_channelName) ||
        !cJSON_IsString(cjson_appId) || !cJSON_IsNumber(cjson_uid)){
         ENTITY_LOGD("rtcToken or channelName or uid or appId is NULL\r\n");
+        ENTITY_LOGW("[AI_TOKEN_TXN] source=nfc result=FAIL reason=field_missing response_id=%s pending=%d age_ms=%" PRIu64 " token=%p channel=%p appId=%p uid=%p\r\n",
+                    response_id_str ? response_id_str : "(null)",
+                    had_pending ? 1 : 0,
+                    age_ms,
+                    (void *)cjson_rtcToken,
+                    (void *)cjson_channelName,
+                    (void *)cjson_appId,
+                    (void *)cjson_uid);
+        if (had_pending)
+        {
+            Entity_Mqtt_Clear_Token_Pending(response_id_str);
+        }
         if(Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb)
             Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb(-1, NULL, NULL, NULL, 0);
         return;
@@ -331,6 +381,18 @@ void Entity_Mqtt_Event_Respone_Agora_Agent_Nfc_Process(cJSON *root)
     char token_mask[32];
     Utils_Mask_Secret(rtcToken_string, token_mask, sizeof(token_mask));
     ENTITY_LOGD("%s rtcToken_mask:%s, channelName_string:%s,appId_string:%s,uid:%d \r\n", __func__, token_mask, channelName_string,appId_string,uid);
+    ENTITY_LOGI("[AI_TOKEN_TXN] source=nfc result=OK response_id=%s pending=%d pending_id=%s age_ms=%" PRIu64 " channel_len=%u token_len=%u uid=%d\r\n",
+                response_id_str ? response_id_str : "(null)",
+                had_pending ? 1 : 0,
+                pending_id[0] ? pending_id : "(none)",
+                age_ms,
+                (unsigned int)(channelName_string ? strlen(channelName_string) : 0),
+                (unsigned int)(rtcToken_string ? strlen(rtcToken_string) : 0),
+                uid);
+    if (had_pending)
+    {
+        Entity_Mqtt_Clear_Token_Pending(response_id_str);
+    }
     if(Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb)
             Entity_Mqtt_Event_Respone_Parse_Cbs.Event_Agora_Agent_Nfc_Parse_Cb(0,rtcToken_string,channelName_string,appId_string,uid);
     

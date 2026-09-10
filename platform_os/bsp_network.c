@@ -59,6 +59,47 @@ static int Bsp_Network_Get_Socket_Error(int fd)
     return error;
 }
 
+#ifndef CONFIG_AIFIGURE_4G_HOT_STANDBY
+#define CONFIG_AIFIGURE_4G_HOT_STANDBY 0
+#endif
+
+#if CONFIG_AIFIGURE_4G_HOT_STANDBY
+extern void aifigure_4g_log_transport_diag(const char *reason,
+                                           int fd,
+                                           int ret,
+                                           int err_no,
+                                           int so_error,
+                                           uint32_t len) __attribute__((weak));
+
+static void Bsp_Network_Aifigure_4g_Transport_Diag(const char *reason,
+                                                   int fd,
+                                                   int ret,
+                                                   int err_no,
+                                                   int so_error,
+                                                   uint32_t len)
+{
+    if (aifigure_4g_log_transport_diag != NULL)
+    {
+        aifigure_4g_log_transport_diag(reason, fd, ret, err_no, so_error, len);
+    }
+}
+#else
+static void Bsp_Network_Aifigure_4g_Transport_Diag(const char *reason,
+                                                   int fd,
+                                                   int ret,
+                                                   int err_no,
+                                                   int so_error,
+                                                   uint32_t len)
+{
+    (void)reason;
+    (void)fd;
+    (void)ret;
+    (void)err_no;
+    (void)so_error;
+    (void)len;
+}
+#endif
+
 /* Some embedded/lwIP builds don't expose gai_strerror; provide a safe fallback
  * that returns a small string representation of the error code. This avoids
  * implicit declaration errors when gai_strerror isn't available.
@@ -307,6 +348,8 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
 
 	struct addrinfo hints, *addr_list, *cur;
 	int fd = -1;
+    int last_connect_errno = 0;
+    int last_connect_so_error = -1;
 	char port_str[6] = {0};
     snprintf(port_str, 6, "%d", pNetwork->Tcp_Connect_Params.Port);
     NET_WORK_LOG("connect host: %s:%s", pNetwork->Tcp_Connect_Params.Host, port_str);
@@ -340,6 +383,11 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
 
     if (ret != 0)
     {
+        NET_WORK_LOG("[NET_DIAG][DNS_RESULT_4G] result=fail host=%s port=%s ret=%d\r\n",
+                     pNetwork->Tcp_Connect_Params.Host,
+                     port_str,
+                     ret);
+        Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_getaddrinfo_fail", -1, ret, 0, -1, 0U);
         return NET_FAILED;
     }
 
@@ -347,6 +395,14 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
 	{
         fd = (int)socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
         if (fd < 0) {
+            last_connect_errno = errno;
+            last_connect_so_error = -1;
+            Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_socket_fail",
+                                                   fd,
+                                                   NET_SOCKET_FAILED,
+                                                   last_connect_errno,
+                                                   last_connect_so_error,
+                                                   0U);
             ret = 0;
             continue;
         } 
@@ -409,10 +465,35 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
                          (unsigned int)tcp_data_params->Active_Reads,
                          (unsigned int)tcp_data_params->Active_Writes,
                          (unsigned int)tcp_data_params->Close_Count);
+            NET_WORK_LOG("[NET_DIAG][CONNECT_RESULT_4G] result=ok host=%s port=%d fd=%d remote_ip=%s local_ip=%s local_port=%d if=%s socket_errno=%d\r\n",
+                         pNetwork->Tcp_Connect_Params.Host,
+                         pNetwork->Tcp_Connect_Params.Port,
+                         fd,
+                         srv_ip,
+                         pNetwork->Interface_Info.Ip,
+                         pNetwork->Interface_Info.Local_Port,
+                         pNetwork->Interface_Info.Name,
+                         Bsp_Network_Get_Socket_Error(fd));
+            Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_connect_ok", fd, 0, 0, Bsp_Network_Get_Socket_Error(fd), 0U);
             break;
         }
 		else{
-            NET_WORK_LOG("connect failed (error:%d %s) server ip: %s port: %d", errno, STRING_PTR_PRINT_SANITY_CHECK(strerror(errno)), srv_ip, pNetwork->Tcp_Connect_Params.Port);
+            last_connect_errno = errno;
+            last_connect_so_error = Bsp_Network_Get_Socket_Error(fd);
+            NET_WORK_LOG("connect failed (error:%d %s) server ip: %s port: %d", last_connect_errno, STRING_PTR_PRINT_SANITY_CHECK(strerror(last_connect_errno)), srv_ip, pNetwork->Tcp_Connect_Params.Port);
+            NET_WORK_LOG("[NET_DIAG][CONNECT_RESULT_4G] result=fail host=%s port=%d fd=%d remote_ip=%s local_ip=- socket_errno=%d errno=%d\r\n",
+                         pNetwork->Tcp_Connect_Params.Host,
+                         pNetwork->Tcp_Connect_Params.Port,
+                         fd,
+                         srv_ip,
+                         last_connect_so_error,
+                         last_connect_errno);
+            Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_connect_fail",
+                                                   fd,
+                                                   NET_CONNECT_FAILED,
+                                                   last_connect_errno,
+                                                   last_connect_so_error,
+                                                   0U);
         }
 
         close(fd);
@@ -423,6 +504,12 @@ int Network_Tcp_Connect(Network_Context_t *pNetwork, const void *tcp_params, con
 
     if (ret == 0) {
         NET_WORK_LOG("failed to connect with TCP server: %s:%s", pNetwork->Tcp_Connect_Params.Host, port_str);
+        Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_connect_failed_all",
+                                               fd,
+                                               NET_CONNECT_FAILED,
+                                               last_connect_errno,
+                                               last_connect_so_error,
+                                               0U);
         return NET_CONNECT_FAILED;
     } 
 
@@ -539,6 +626,12 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
                      (unsigned int)tcp_data_params->Close_Count,
                      (unsigned int)len);
         NET_WORK_LOG("invalid socket fd: %d\r\n", fd);
+        Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_write_invalid_fd",
+                                               fd,
+                                               NET_INVALID_PARM,
+                                               0,
+                                               -1,
+                                               (uint32_t)len);
         return NET_INVALID_PARM;
     }
     uint32_t fd_generation = tcp_data_params->Generation;
@@ -598,6 +691,12 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
                              (unsigned int)len,
                              (unsigned int)t_left,
                              (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms));
+                Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_write_select_timeout",
+                                                       fd,
+                                                       NET_TIMEOUT,
+                                                       0,
+                                                       Bsp_Network_Get_Socket_Error(fd),
+                                                       (uint32_t)len);
                 break;
             } 
 			else 
@@ -646,6 +745,7 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
             else 
             {
                 last_errno = errno;
+                int send_so_error = Bsp_Network_Get_Socket_Error(fd);
                 if (EINTR == errno)
                 {
                     NET_WORK_LOG("EINTR be caught\r\n");
@@ -668,6 +768,12 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
                              (unsigned int)tcp_data_params->Active_Reads,
                              (unsigned int)tcp_data_params->Active_Writes,
                              (unsigned int)tcp_data_params->Close_Count);
+                Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_send_fail",
+                                                       fd,
+                                                       NET_FAILED,
+                                                       last_errno,
+                                                       send_so_error,
+                                                       (uint32_t)len);
                 break;
             }
         } 
@@ -731,6 +837,12 @@ int Network_Tcp_Write(Network_Context_t *pNetwork, const unsigned char *pMsg, si
                      (unsigned int)(Bsp_Get_Run_Time_Ms() - start_ms),
                      (unsigned int)send_call_count,
                      (unsigned int)select_ready_count);
+        Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_write_partial",
+                                               fd,
+                                               NET_TIMEOUT,
+                                               last_errno,
+                                               Bsp_Network_Get_Socket_Error(fd),
+                                               (uint32_t)len);
         return NET_TIMEOUT;
     }
     else
@@ -776,6 +888,12 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
                      (unsigned int)tcp_data_params->Close_Count,
                      (unsigned int)len);
         NET_WORK_LOG("invalid socket fd: %d\r\n", fd);
+        Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_read_invalid_fd",
+                                               fd,
+                                               NET_INVALID_PARM,
+                                               0,
+                                               -1,
+                                               (uint32_t)len);
         return NET_INVALID_PARM;
     }
     uint32_t fd_generation = tcp_data_params->Generation;
@@ -818,8 +936,9 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
 			{
                 len_recv += ret;
             } 
-			else if (0 == ret) 
+            else if (0 == ret)
 			{
+                int eof_so_error = Bsp_Network_Get_Socket_Error(fd);
                 NET_WORK_LOG("[NET_DIAG][READ_EOF] fd=%d gen=%u recv=%u/%u elapsed=%u ready=%u calls=%u "
                              "active_r=%u active_w=%u close_count=%u\r\n",
                              (int)fd,
@@ -832,12 +951,19 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
                              (unsigned int)tcp_data_params->Active_Reads,
                              (unsigned int)tcp_data_params->Active_Writes,
                              (unsigned int)tcp_data_params->Close_Count);
+                Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_read_eof",
+                                                       fd,
+                                                       NET_CONN_EOF,
+                                                       0,
+                                                       eof_so_error,
+                                                       (uint32_t)len);
                 err_code = NET_CONN_EOF;
                 break;
             } 
 			else
 			{
                 last_errno = errno;
+                int recv_so_error = Bsp_Network_Get_Socket_Error(fd);
                 if (EINTR == errno) {
                     NET_WORK_LOG("EINTR be caught\r\n");
                     continue;
@@ -861,6 +987,12 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
                              (unsigned int)tcp_data_params->Active_Reads,
                              (unsigned int)tcp_data_params->Active_Writes,
                              (unsigned int)tcp_data_params->Close_Count);
+                Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_recv_error",
+                                                       fd,
+                                                       NET_FAILED,
+                                                       last_errno,
+                                                       recv_so_error,
+                                                       (uint32_t)len);
                 err_code = NET_FAILED;
                 break;
             }
@@ -873,6 +1005,7 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
 		else 
 		{
             last_errno = errno;
+            int select_so_error = Bsp_Network_Get_Socket_Error(fd);
             NET_WORK_LOG("[NET_DIAG][READ_SELECT_ERROR] fd=%d gen=%u now_fd=%d now_gen=%u errno=%d(%s) "
                          "recv=%u/%u eagain=%u active_r=%u active_w=%u close_count=%u\r\n",
                          (int)fd,
@@ -887,6 +1020,12 @@ int Network_Tcp_Read(Network_Context_t *pNetwork, unsigned char *pMsg, size_t le
                          (unsigned int)tcp_data_params->Active_Reads,
                          (unsigned int)tcp_data_params->Active_Writes,
                          (unsigned int)tcp_data_params->Close_Count);
+            Bsp_Network_Aifigure_4g_Transport_Diag("mqtt_tcp_read_select_error",
+                                                   fd,
+                                                   NET_FAILED,
+                                                   last_errno,
+                                                   select_so_error,
+                                                   (uint32_t)len);
             err_code = NET_FAILED;
             break;
         }
@@ -1944,7 +2083,6 @@ int Bsp_Network_Socket_Close(int sockfd)
     }
     return 0;
 }
-
 
 
 

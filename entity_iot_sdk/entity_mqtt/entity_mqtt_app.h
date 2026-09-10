@@ -103,5 +103,8 @@ const char *Entity_Mqtt_App_Broker_State_Name(uint8_t state);
 //主动要求 MQTT 重连；AI token 超时等关键路径使用
 bool Entity_Mqtt_App_Force_Reconnect(const char *reason);
 
+//记录 MQTT task 是否及时消化重连请求；返回 false 表示 pending 超过 stale_ms 仍未进入 RECONNECT_BEGIN
+bool Entity_Mqtt_App_Log_Reconnect_Liveness(const char *reason, uint32_t stale_ms);
+
 /* 兼容旧调用点：esp-mqtt keepalive 已恢复为内建维护，此函数仅记录 no-op 日志。 */
 void Entity_Mqtt_App_Reset_Keepalive(void);

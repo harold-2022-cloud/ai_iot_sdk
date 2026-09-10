@@ -42,6 +42,8 @@
 #define ENTITY_MQTT_APP_TASK_STACK_SIZE       12288
 #define ENTITY_MQTT_APP_HEARTBEAT_MS          45000
 #define ENTITY_MQTT_AI_PENDING_QOS1_STALE_MS  10000
+#define ENTITY_MQTT_APP_SLEEP_POLL_MS         100
+#define ENTITY_MQTT_RECONNECT_STUCK_MS        2000
 
 #ifndef AI_HOTPATH_VERBOSE_LOGS
 #ifdef CONFIG_AI_HOTPATH_VERBOSE_LOGS
@@ -57,6 +59,39 @@
             ENTITY_LOGI(__VA_ARGS__);     \
         }                                 \
     } while (0)
+
+#ifndef CONFIG_AIFIGURE_4G_HOT_STANDBY
+#define CONFIG_AIFIGURE_4G_HOT_STANDBY 0
+#endif
+
+#if CONFIG_AIFIGURE_4G_HOT_STANDBY
+extern void aifigure_4g_log_network_diag(const char *reason) __attribute__((weak));
+
+static void Entity_Mqtt_App_Aifigure_4g_Diag(const char *reason)
+{
+    if (aifigure_4g_log_network_diag != NULL)
+    {
+        aifigure_4g_log_network_diag(reason);
+    }
+}
+#else
+static void Entity_Mqtt_App_Aifigure_4g_Diag(const char *reason)
+{
+    (void)reason;
+}
+#endif
+
+static bool Entity_Mqtt_App_Aifigure_4g_Is_Route_Switch(const char *reason)
+{
+#if CONFIG_AIFIGURE_4G_HOT_STANDBY
+    return (reason != NULL) &&
+           ((strcmp(reason, "4g_ppp_got_ip_route_switch") == 0) ||
+            (strcmp(reason, "netmgr_wifi_route_switch") == 0));
+#else
+    (void)reason;
+    return false;
+#endif
+}
 
 static Entity_Mqtt_Context_t Entity_Client_Instance = {0};
 static void * Mqtt_Client_Thread_Id;
@@ -113,6 +148,13 @@ static volatile uint32_t s_connected_post_seq = 0;
 static uint32_t s_agent_trace_seq = 0;
 static volatile uint32_t s_mqtt_task_stack_hwm = 0;
 static volatile uint8_t s_mqtt_task_priority = 0;
+static volatile uint32_t s_mqtt_force_reconnect_seq = 0;
+static volatile uint32_t s_mqtt_reconnect_pending_since_ms = 0;
+static volatile uint32_t s_mqtt_last_loop_enter_ms = 0;
+static volatile uint32_t s_mqtt_last_loop_exit_ms = 0;
+static volatile uint32_t s_mqtt_last_need_sleep_ms = 0;
+static volatile uint32_t s_mqtt_sleep_until_ms = 0;
+static volatile uint32_t s_mqtt_sleep_interrupt_count = 0;
 
 static uint32_t Entity_Mqtt_App_Current_Task_Stack_Hwm(void)
 {
@@ -155,6 +197,12 @@ static bool Entity_Mqtt_App_Buffer_Contains(const char *data, int len, const cha
         }
     }
     return false;
+}
+
+static bool Entity_Mqtt_App_Is_Ai_Access_Request(const char *data, int len)
+{
+    return Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_device_access") ||
+           Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_nfc_report");
 }
 
 static const char *Entity_Mqtt_App_State_Str(uint8_t state)
@@ -217,6 +265,11 @@ static uint32_t Entity_Mqtt_App_Now_Ms(void)
     return Entity_Get_Run_Time_Ms();
 }
 
+static uint32_t Entity_Mqtt_App_Ms_Age(uint32_t now_ms, uint32_t since_ms)
+{
+    return (since_ms == 0U) ? 0U : (now_ms - since_ms);
+}
+
 static void Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot(const char *stage, const char *reason)
 {
     Entity_Mqtt_Context_t *context = &Entity_Client_Instance;
@@ -255,6 +308,48 @@ static void Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot(const char *stage, co
               (unsigned long long)token_pub_ms,
               (unsigned int)health.mqtt_task_priority,
               (unsigned int)health.mqtt_task_stack_hwm);
+}
+
+static void Entity_Mqtt_App_Sleep_Interruptible(Entity_Mqtt_Context_t *context, int sleep_ms)
+{
+    if (sleep_ms <= 0)
+    {
+        return;
+    }
+
+    s_mqtt_last_need_sleep_ms = (uint32_t)sleep_ms;
+    s_mqtt_sleep_until_ms = Entity_Mqtt_App_Now_Ms() + (uint32_t)sleep_ms;
+
+    while (sleep_ms > 0)
+    {
+        if (context != NULL && context->Reconnect_Pending)
+        {
+            uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
+            const char *reason = context->Reconnect_Reason[0] ?
+                                 context->Reconnect_Reason : "unknown";
+            s_mqtt_sleep_interrupt_count++;
+            ENTITY_LOGW("[MQTT_DIAG][APP_SLEEP_INTERRUPTED] reason=%s state=%s "
+                      "pending_age=%u remaining_ms=%d last_sleep_ms=%u "
+                      "interrupts=%u force_seq=%u task_prio=%u task_stack_hwm=%u\r\n",
+                      reason,
+                      Entity_Mqtt_App_State_Str(context->State),
+                      (unsigned int)Entity_Mqtt_App_Ms_Age(now_ms, s_mqtt_reconnect_pending_since_ms),
+                      sleep_ms,
+                      (unsigned int)s_mqtt_last_need_sleep_ms,
+                      (unsigned int)s_mqtt_sleep_interrupt_count,
+                      (unsigned int)s_mqtt_force_reconnect_seq,
+                      (unsigned int)s_mqtt_task_priority,
+                      (unsigned int)s_mqtt_task_stack_hwm);
+            break;
+        }
+
+        int chunk_ms = (sleep_ms > ENTITY_MQTT_APP_SLEEP_POLL_MS) ?
+                       ENTITY_MQTT_APP_SLEEP_POLL_MS : sleep_ms;
+        Entity_Sleep_Ms(chunk_ms);
+        sleep_ms -= chunk_ms;
+    }
+
+    s_mqtt_sleep_until_ms = 0;
 }
 
 static bool Entity_Mqtt_App_Topic_Equals(const char *rx_topic, const char *expected_topic)
@@ -756,6 +851,7 @@ static void Entity_Mqtt_Disconnected_Callback(Entity_Mqtt_Context_t* context, vo
     s_connected_post_pending = false;
     Entity_Mqtt_App_Drop_Deferred_Ai_Publish("app_disconnected");
     ENTITY_LOGI("----------now mqtt client disconnected-----------\r\n");
+    Entity_Mqtt_App_Aifigure_4g_Diag("mqtt_app_disconnected_cb");
     ENTITY_LOGW("[MQTT_DIAG][APP_DISCONNECTED_CB] state=%s ctx_connected=%d queue_depth=%u\r\n",
               Entity_Mqtt_App_State_Str(context->State),
               context->Is_Connected ? 1 : 0,
@@ -930,6 +1026,8 @@ void Entity_Mqtt_Client_Task(void *arg)
 	ret = Entity_Mqtt_Init(entity_context, &entity_config);
     if(ret != OPRT_OK){
         Flag_Entity_Mqtt_App_Task_Over = 1;
+        Flag_Entity_Mqtt_App_Task_Runing = 0;
+        Entity_Pthread_Delete(&Mqtt_Client_Thread_Id);
         return;
     }
  #if 0  
@@ -953,9 +1051,16 @@ void Entity_Mqtt_Client_Task(void *arg)
         Entity_Mqtt_App_Drain_Agent_Queue(entity_context);
         uint32_t loop_enter_ms = Entity_Mqtt_App_Now_Ms();
         uint32_t loop_enter_depth = s_agent_queue ? (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0;
+        s_mqtt_last_loop_enter_ms = loop_enter_ms;
         int need_sleep_ms = Entity_Mqtt_Loop(entity_context);
         uint32_t loop_exit_ms = Entity_Mqtt_App_Now_Ms();
         uint32_t loop_cost_ms = loop_exit_ms - loop_enter_ms;
+        s_mqtt_last_loop_exit_ms = loop_exit_ms;
+        s_mqtt_last_need_sleep_ms = (need_sleep_ms > 0) ? (uint32_t)need_sleep_ms : 0U;
+        if (!entity_context->Reconnect_Pending)
+        {
+            s_mqtt_reconnect_pending_since_ms = 0;
+        }
         bool should_exit = (entity_context->Prohibit_Connect && !entity_context->Is_Connected);
         Entity_Mqtt_Connected_Post_Process(entity_context);
         uint32_t queue_depth = s_agent_queue ? (uint32_t)Entity_Msg_Queue_Get_Msg_Num(&s_agent_queue) : 0;
@@ -980,6 +1085,7 @@ void Entity_Mqtt_Client_Task(void *arg)
 
         if (need_sleep_ms > 0)
         {
+            Entity_Mqtt_App_Aifigure_4g_Diag("mqtt_app_loop_sleep");
             ENTITY_LOGW("[MQTT_DIAG][APP_LOOP_SLEEP] state=%s ctx_connected=%d "
                       "app_connected=%d queue_depth=%u sleep=%d\r\n",
                       Entity_Mqtt_App_State_Str(entity_context->State),
@@ -1020,7 +1126,7 @@ void Entity_Mqtt_Client_Task(void *arg)
 
         if (need_sleep_ms > 0)
         {
-            Entity_Sleep_Ms(need_sleep_ms);
+            Entity_Mqtt_App_Sleep_Interruptible(entity_context, need_sleep_ms);
         }
         if(should_exit)//已断连且禁止重连，则退出任务
         {
@@ -1155,13 +1261,16 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
      *      導致 Controller Task 卡住 20s。
      *   3. 資料生命週期由 data_copy（PSRAM）延伸至 Agent Task 消費完畢。*/
 
-    bool ai_access = Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_device_access");
+    bool ai_access = Entity_Mqtt_App_Is_Ai_Access_Request(data, len);
     Entity_Mqtt_Effective_State_t effective =
         Entity_Mqtt_App_Get_Effective_State(&Entity_Client_Instance, false, NULL, NULL);
 
     if (!Entity_Mqtt_Effective_Can_Publish(effective))
     {
-        if (ai_access && effective == ENTITY_MQTT_EFFECTIVE_PROBING)
+        if (ai_access &&
+            (effective == ENTITY_MQTT_EFFECTIVE_PROBING ||
+             effective == ENTITY_MQTT_EFFECTIVE_CONNECTING ||
+             effective == ENTITY_MQTT_EFFECTIVE_SUBSCRIBING))
         {
             if (s_agent_queue == NULL)
             {
@@ -1304,7 +1413,9 @@ Entity_Mqtt_Ai_Publish_Result_t Entity_Mqtt_App_Prepare_Ai_Publish_Result(void)
         return ENTITY_MQTT_AI_PUBLISH_READY;
     }
 
-    if (effective == ENTITY_MQTT_EFFECTIVE_PROBING)
+    if (effective == ENTITY_MQTT_EFFECTIVE_PROBING ||
+        effective == ENTITY_MQTT_EFFECTIVE_CONNECTING ||
+        effective == ENTITY_MQTT_EFFECTIVE_SUBSCRIBING)
     {
         uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
         if (s_last_ai_publish_reconnect_decision_log_ms == 0U ||
@@ -1516,14 +1627,131 @@ void Entity_Mqtt_App_Reset_Keepalive(void)
     ENTITY_LOGI("[mqtt] Entity_Mqtt_App_Reset_Keepalive: no-op (esp-mqtt keepalive enabled)\r\n");
 }
 
+bool Entity_Mqtt_App_Log_Reconnect_Liveness(const char *reason, uint32_t stale_ms)
+{
+    Entity_Mqtt_Context_t *context = &Entity_Client_Instance;
+    uint32_t now_ms = Entity_Mqtt_App_Now_Ms();
+    uint32_t pending_since = s_mqtt_reconnect_pending_since_ms;
+    uint32_t pending_age = context->Reconnect_Pending ?
+                           Entity_Mqtt_App_Ms_Age(now_ms, pending_since) : 0U;
+    uint32_t loop_enter_age = Entity_Mqtt_App_Ms_Age(now_ms, s_mqtt_last_loop_enter_ms);
+    uint32_t loop_exit_age = Entity_Mqtt_App_Ms_Age(now_ms, s_mqtt_last_loop_exit_ms);
+    uint32_t sleep_left = 0U;
+    uint32_t sleep_until = s_mqtt_sleep_until_ms;
+    uint32_t stuck_ms = (stale_ms != 0U) ? stale_ms : ENTITY_MQTT_RECONNECT_STUCK_MS;
+    bool stale = context->Reconnect_Pending &&
+                 pending_since != 0U &&
+                 pending_age >= stuck_ms;
+    bool task_missing = (Flag_Entity_Mqtt_App_Task_Runing == 0U) &&
+                        !context->Is_Connected &&
+                        !s_mqtt_app_connected;
+
+    if (sleep_until != 0U && (int32_t)(sleep_until - now_ms) > 0)
+    {
+        sleep_left = sleep_until - now_ms;
+    }
+
+    ENTITY_LOGW("[MQTT_DIAG][RECONNECT_LIVENESS] reason=%s task_running=%u task_over=%u "
+              "pending=%d pending_age=%u stale_ms=%u state=%s app_connected=%d "
+              "ctx_connected=%d last_sleep_ms=%u sleep_left_ms=%u loop_enter_age=%u "
+              "loop_exit_age=%u force_seq=%u sleep_interrupts=%u task_prio=%u "
+              "task_stack_hwm=%u\r\n",
+              reason ? reason : "unknown",
+              (unsigned int)Flag_Entity_Mqtt_App_Task_Runing,
+              (unsigned int)Flag_Entity_Mqtt_App_Task_Over,
+              context->Reconnect_Pending ? 1 : 0,
+              (unsigned int)pending_age,
+              (unsigned int)stuck_ms,
+              Entity_Mqtt_App_State_Str(context->State),
+              s_mqtt_app_connected ? 1 : 0,
+              context->Is_Connected ? 1 : 0,
+              (unsigned int)s_mqtt_last_need_sleep_ms,
+              (unsigned int)sleep_left,
+              (unsigned int)loop_enter_age,
+              (unsigned int)loop_exit_age,
+              (unsigned int)s_mqtt_force_reconnect_seq,
+              (unsigned int)s_mqtt_sleep_interrupt_count,
+              (unsigned int)s_mqtt_task_priority,
+              (unsigned int)s_mqtt_task_stack_hwm);
+
+    if (stale || task_missing)
+    {
+        ENTITY_LOGE("[MQTT_DIAG][RECONNECT_PENDING_STUCK] reason=%s pending_age=%u stale_ms=%u state=%s last_sleep_ms=%u sleep_left_ms=%u task_running=%u task_over=%u task_missing=%u\r\n",
+                  reason ? reason : "unknown",
+                  (unsigned int)pending_age,
+                  (unsigned int)stuck_ms,
+                  Entity_Mqtt_App_State_Str(context->State),
+                  (unsigned int)s_mqtt_last_need_sleep_ms,
+                  (unsigned int)sleep_left,
+                  (unsigned int)Flag_Entity_Mqtt_App_Task_Runing,
+                  (unsigned int)Flag_Entity_Mqtt_App_Task_Over,
+                  task_missing ? 1U : 0U);
+    }
+    return !stale && !task_missing;
+}
+
 bool Entity_Mqtt_App_Force_Reconnect(const char *reason)
 {
-    if (Entity_Client_Instance.Reconnect_Pending ||
-        Entity_Client_Instance.State == ENTITY_MQTT_CONNCET_STATE)
+    bool route_switch = Entity_Mqtt_App_Aifigure_4g_Is_Route_Switch(reason);
+    uint8_t task_running_before = Flag_Entity_Mqtt_App_Task_Runing;
+    uint8_t task_over_before = Flag_Entity_Mqtt_App_Task_Over;
+
+    if (Flag_Entity_Mqtt_App_Task_Runing == 0U)
+    {
+        int start_ret;
+
+        Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot("force_reconnect_task_missing", reason);
+        s_mqtt_app_connected = false;
+        start_ret = Entity_Mqtt_Client_Task_Start();
+        ENTITY_LOGW("[MQTT_DIAG][RECONNECT_TASK_START] reason=%s ret=%d task_running_before=%u task_over_before=%u task_running_after=%u task_over_after=%u state=%s\r\n",
+                  reason ? reason : "unknown",
+                  start_ret,
+                  (unsigned int)task_running_before,
+                  (unsigned int)task_over_before,
+                  (unsigned int)Flag_Entity_Mqtt_App_Task_Runing,
+                  (unsigned int)Flag_Entity_Mqtt_App_Task_Over,
+                  Entity_Mqtt_App_State_Str(Entity_Client_Instance.State));
+        if (start_ret == 0)
+        {
+            s_mqtt_force_reconnect_seq++;
+            s_mqtt_reconnect_pending_since_ms = 0;
+            s_mqtt_sleep_until_ms = 0;
+            return true;
+        }
+        return false;
+    }
+
+    if ((Entity_Client_Instance.Reconnect_Pending ||
+         Entity_Client_Instance.State == ENTITY_MQTT_CONNCET_STATE) &&
+        !route_switch)
     {
         return true;
     }
+    if (route_switch &&
+        (Entity_Client_Instance.Reconnect_Pending ||
+         Entity_Client_Instance.State == ENTITY_MQTT_CONNCET_STATE))
+    {
+        Entity_Mqtt_App_Aifigure_4g_Diag("mqtt_route_switch_app_force_cleanup");
+        ENTITY_LOGW("[MQTT_DIAG][APP_ROUTE_SWITCH_FORCE_CLEANUP] pending=%d state=%u\r\n",
+                    Entity_Client_Instance.Reconnect_Pending ? 1 : 0,
+                    (unsigned int)Entity_Client_Instance.State);
+    }
     Entity_Mqtt_App_Log_Reconnect_Pending_Snapshot("force_reconnect", reason);
+    s_mqtt_force_reconnect_seq++;
+    s_mqtt_reconnect_pending_since_ms = Entity_Mqtt_App_Now_Ms();
+    ENTITY_LOGW("[MQTT_DIAG][RECONNECT_WAKE_REQUEST] reason=%s force_seq=%u "
+              "task_running=%u task_over=%u state=%s pending=%d "
+              "last_sleep_ms=%u sleep_until_ms=%u task_prio=%u task_stack_hwm=%u\r\n",
+              reason ? reason : "unknown",
+              (unsigned int)s_mqtt_force_reconnect_seq,
+              (unsigned int)Flag_Entity_Mqtt_App_Task_Runing,
+              (unsigned int)Flag_Entity_Mqtt_App_Task_Over,
+              Entity_Mqtt_App_State_Str(Entity_Client_Instance.State),
+              Entity_Client_Instance.Reconnect_Pending ? 1 : 0,
+              (unsigned int)s_mqtt_last_need_sleep_ms,
+              (unsigned int)s_mqtt_sleep_until_ms,
+              (unsigned int)s_mqtt_task_priority,
+              (unsigned int)s_mqtt_task_stack_hwm);
     s_mqtt_app_connected = false;
     return Entity_Mqtt_Force_Reconnect(&Entity_Client_Instance, reason) == OPRT_OK;
 }
