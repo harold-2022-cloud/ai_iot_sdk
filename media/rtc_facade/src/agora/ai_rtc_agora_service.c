@@ -239,10 +239,19 @@ static int service_fail_connection_lost_deferred_timeout(void)
 static void on_port_network_event(Ai_Rtc_Agora_Port_Network_Event_t event, void *user)
 {
     (void)user;
-    if (s_agora.sdk_initialized)
+    network_event_e mapped_event = map_port_network_event(event);
+    bool sdk_initialized = s_agora.sdk_initialized;
+    int notify_ret = AI_RTC_FACADE_ERR_NOT_READY;
+
+    if (sdk_initialized)
     {
-        (void)agora_rtc_notify_network_event(map_port_network_event(event));
+        notify_ret = agora_rtc_notify_network_event(mapped_event);
     }
+    AI_RTC_AGORA_LOG("[RTC_AGORA_NET_EVENT] event=%d mapped=%d sdk_initialized=%d ret=%d",
+                     (int)event,
+                     (int)mapped_event,
+                     sdk_initialized ? 1 : 0,
+                     notify_ret);
 }
 
 static bool service_accept_callback(connection_id_t conn_id)
