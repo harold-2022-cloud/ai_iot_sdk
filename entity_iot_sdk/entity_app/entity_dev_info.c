@@ -15,6 +15,37 @@ static Entity_Dev_Cbs_t Entity_Dev_Cbs;
 static unsigned char Entity_Dev_State;
 static Entity_Mutex_t s_state_mutex = NULL;
 
+static size_t Entity_Diag_Strnlen(const char *value, size_t max_len)
+{
+    size_t len = 0;
+
+    if (value == NULL)
+    {
+        return 0;
+    }
+
+    while (len < max_len && value[len] != '\0')
+    {
+        len++;
+    }
+
+    return len;
+}
+
+static uint32_t Entity_Diag_Hash_String(const char *value, size_t max_len)
+{
+    size_t len = Entity_Diag_Strnlen(value, max_len);
+    uint32_t hash = 2166136261u;
+
+    for (size_t i = 0; i < len; ++i)
+    {
+        hash ^= (uint8_t)value[i];
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
 
 /**
 *@名称 		Get_Entity_Dev_State
@@ -339,6 +370,29 @@ void Entity_Config_Net_Data_Check(void)
     ENTITY_LOGD("%s Flag_Bind:%d, Bind_Type:%d, ssid:%s, passwd_len:%u, mqtt:%s, port:%d\r\n", \
        __func__, Entity_App_Param.Dev_Config_Net_Info.Flag_Bind, Entity_App_Param.Dev_Config_Net_Info.Bind_Type, config_net_info->Wifi_Info.Ssid,\
          (unsigned int)strlen(config_net_info->Wifi_Info.Key), config_net_info->Mqtt_Info.Mqtt_Host, config_net_info->Mqtt_Info.Mqtt_Port);
+
+    ENTITY_LOGI("[CONFIG_NET_DIAG][READ] magic=0x%08X flag_bind=%u bind_type=%u wifi_valid=%u clean=%u "
+                "ssid_len=%u ssid_hash=0x%08X pwd_len=%u pwd_hash=0x%08X "
+                "mqtt_host_len=%u mqtt_host_hash=0x%08X mqtt_port=%u "
+                "country_len=%u country_hash=0x%08X bind_id_len=%u bind_id_hash=0x%08X user_id_len=%u user_id_hash=0x%08X\r\n",
+                (unsigned)Entity_App_Param.Dev_Config_Net_Info.Magic_Header,
+                Entity_App_Param.Dev_Config_Net_Info.Flag_Bind,
+                Entity_App_Param.Dev_Config_Net_Info.Bind_Type,
+                Entity_App_Param.Dev_Config_Net_Info.Flag_Wifi_Info_Vaild,
+                Entity_App_Param.Dev_Config_Net_Info.Flag_Clean_Data,
+                (unsigned)Entity_Diag_Strnlen(config_net_info->Wifi_Info.Ssid, sizeof(config_net_info->Wifi_Info.Ssid)),
+                (unsigned)Entity_Diag_Hash_String(config_net_info->Wifi_Info.Ssid, sizeof(config_net_info->Wifi_Info.Ssid)),
+                (unsigned)Entity_Diag_Strnlen(config_net_info->Wifi_Info.Key, sizeof(config_net_info->Wifi_Info.Key)),
+                (unsigned)Entity_Diag_Hash_String(config_net_info->Wifi_Info.Key, sizeof(config_net_info->Wifi_Info.Key)),
+                (unsigned)Entity_Diag_Strnlen(config_net_info->Mqtt_Info.Mqtt_Host, sizeof(config_net_info->Mqtt_Info.Mqtt_Host)),
+                (unsigned)Entity_Diag_Hash_String(config_net_info->Mqtt_Info.Mqtt_Host, sizeof(config_net_info->Mqtt_Info.Mqtt_Host)),
+                config_net_info->Mqtt_Info.Mqtt_Port,
+                (unsigned)Entity_Diag_Strnlen(config_net_info->Country_Code, sizeof(config_net_info->Country_Code)),
+                (unsigned)Entity_Diag_Hash_String(config_net_info->Country_Code, sizeof(config_net_info->Country_Code)),
+                (unsigned)Entity_Diag_Strnlen(config_net_info->Bind_Id, sizeof(config_net_info->Bind_Id)),
+                (unsigned)Entity_Diag_Hash_String(config_net_info->Bind_Id, sizeof(config_net_info->Bind_Id)),
+                (unsigned)Entity_Diag_Strnlen(config_net_info->User_Id, sizeof(config_net_info->User_Id)),
+                (unsigned)Entity_Diag_Hash_String(config_net_info->User_Id, sizeof(config_net_info->User_Id)));
 }
  
 /**
@@ -500,8 +554,15 @@ int Entity_Load_Dev_Info(const char *pid, const char *product_secret, const char
 
     Entity_Triple_Info_t *triple_info = Entity_Get_Triple_Info();
     Entity_App_Param_t *app_param = Get_Entity_App_Param();
+    Entity_Config_Net_Info_t *config_net_info = &app_param->Dev_Config_Net_Info.Config_Net_Info;
+    bool has_wifi_cred = (config_net_info->Wifi_Info.Ssid[0] != '\0');
+    bool wifi_verified = (app_param->Dev_Config_Net_Info.Flag_Wifi_Info_Vaild != 0);
     strncpy(triple_info->Pid, pid, sizeof(triple_info->Pid)-1);
-    ENTITY_LOGI("Flag_Bind:%d, Bind_Type:%d\r\n", app_param->Dev_Config_Net_Info.Flag_Bind, app_param->Dev_Config_Net_Info.Bind_Type);
+    ENTITY_LOGI("Flag_Bind:%d, Bind_Type:%d, Flag_Wifi_Info_Vaild:%d, has_wifi_cred:%d\r\n",
+                app_param->Dev_Config_Net_Info.Flag_Bind,
+                app_param->Dev_Config_Net_Info.Bind_Type,
+                app_param->Dev_Config_Net_Info.Flag_Wifi_Info_Vaild,
+                has_wifi_cred ? 1 : 0);
 
     if (test_triple != NULL)//使用测试三元组
     {
@@ -533,14 +594,17 @@ int Entity_Load_Dev_Info(const char *pid, const char *product_secret, const char
 #if 0 // 临时强制清除绑定状态，用于测试配网
        // app_param->Dev_Config_Net_Info.Flag_Bind = 0;
 #endif
-        if(app_param->Dev_Config_Net_Info.Flag_Bind)
+        if(app_param->Dev_Config_Net_Info.Flag_Bind &&
+           app_param->Dev_Config_Net_Info.Bind_Type == BLE_BIND_TYPE)
         {
-            if(app_param->Dev_Config_Net_Info.Bind_Type == WIFI_BIND_TYPE)
-                Entity_Dev_State = DEV_WIFI_PROVISION_STATE;
-            else if(app_param->Dev_Config_Net_Info.Bind_Type == BLE_BIND_TYPE)
-                Entity_Dev_State = DEV_BLE_PROVISION_STATE;
-            else
-                Entity_Dev_State = DEV_UNPROVISION_STATE;
+            Entity_Dev_State = DEV_BLE_PROVISION_STATE;
+        }
+        else if(has_wifi_cred)
+        {
+            Entity_Dev_State = DEV_WIFI_PROVISION_STATE;
+            ENTITY_LOGI("[ENTITY_BOOT] saved Wi-Fi credential found verified=%d bind=%d; start STA\r\n",
+                        wifi_verified ? 1 : 0,
+                        app_param->Dev_Config_Net_Info.Flag_Bind ? 1 : 0);
         }
         else
         {
@@ -554,8 +618,6 @@ int Entity_Load_Dev_Info(const char *pid, const char *product_secret, const char
     ENTITY_LOGI("三元组 Uuid:%s, SecretMask:%s, Mac:%s, Entity_Dev_State:%d\r\n", triple_info->Uuid, secret_mask, triple_info->Mac, Entity_Dev_State);
     return Entity_Dev_State;
 }
-
-
 
 
 
