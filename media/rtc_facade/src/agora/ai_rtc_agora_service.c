@@ -417,6 +417,7 @@ static void on_reconnecting(connection_id_t conn_id)
     }
     const bool remote_snapshot = service_snapshot_remote_before_reconnect();
     s_agora.joined = false;
+    s_agora.remote_user_joined = false;
     s_agora.phase = AI_RTC_AGORA_SESSION_RECONNECTING;
     AI_RTC_AGORA_LOG("callback reconnecting conn=%d gen=%lu remote_snapshot=%d",
                      (int)conn_id,
@@ -433,6 +434,7 @@ static void on_connection_lost(connection_id_t conn_id)
     }
     const bool remote_snapshot = service_snapshot_remote_before_reconnect();
     s_agora.joined = false;
+    s_agora.remote_user_joined = false;
     if (service_connection_lost_can_defer())
     {
         s_agora.phase = AI_RTC_AGORA_SESSION_RECONNECTING;
@@ -448,6 +450,7 @@ static void on_connection_lost(connection_id_t conn_id)
         return;
     }
     s_agora.phase = AI_RTC_AGORA_SESSION_FAILED;
+    s_agora.remote_user_joined = false;
     s_agora.remote_user_joined_before_reconnect = false;
     AI_RTC_AGORA_LOG("callback connection_lost conn=%d gen=%lu remote_snapshot=%d",
                      (int)conn_id,
@@ -463,19 +466,19 @@ static void on_rejoin_channel_success(connection_id_t conn_id, uint32_t uid, int
     {
         return;
     }
-    const bool restore_remote = s_agora.remote_user_joined_before_reconnect;
+    const bool remote_snapshot = s_agora.remote_user_joined_before_reconnect;
     s_agora.conn_id = conn_id;
     s_agora.joined = true;
-    s_agora.remote_user_joined = restore_remote;
+    s_agora.remote_user_joined = false;
     s_agora.remote_user_joined_before_reconnect = false;
     s_agora.phase = AI_RTC_AGORA_SESSION_JOINED;
     service_clear_connection_lost_deferred();
-    AI_RTC_AGORA_LOG("callback rejoined conn=%d uid=%lu elapsed_ms=%d gen=%lu remote_restore=%d",
+    AI_RTC_AGORA_LOG("callback rejoined conn=%d uid=%lu elapsed_ms=%d gen=%lu remote_snapshot=%d",
                      (int)conn_id,
                      (unsigned long)uid,
                      elapsed_ms,
                      (unsigned long)s_agora.generation,
-                     restore_remote ? 1 : 0);
+                     remote_snapshot ? 1 : 0);
     (void)Ai_Rtc_Agora_Control_On_Rtc_Joined(&s_agora.control_state, conn_id);
     Ai_Rtc_Facade_Backend_Notify_Rejoined(elapsed_ms);
 }

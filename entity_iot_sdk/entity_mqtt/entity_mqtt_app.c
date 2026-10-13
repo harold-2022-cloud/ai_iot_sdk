@@ -1261,7 +1261,9 @@ int Entity_Mqtt_App_Topic_Publish(Topic_Type_e type_e, const char *data, int len
      *      導致 Controller Task 卡住 20s。
      *   3. 資料生命週期由 data_copy（PSRAM）延伸至 Agent Task 消費完畢。*/
 
-    bool ai_access = Entity_Mqtt_App_Is_Ai_Access_Request(data, len);
+    bool ai_access =
+        Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_device_access") ||
+        Entity_Mqtt_App_Buffer_Contains(data, len, "agora_agent_nfc_report");
     Entity_Mqtt_Effective_State_t effective =
         Entity_Mqtt_App_Get_Effective_State(&Entity_Client_Instance, false, NULL, NULL);
 
