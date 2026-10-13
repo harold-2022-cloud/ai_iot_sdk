@@ -47,8 +47,8 @@ int Entity_Get_Encryption_Data(uint8_t type, char *costom_str, char *uuid, char 
 	ENTITY_LOGI("UUID = %s, SecretMask = %s, aes_key_mask = %s\r\n", uuid, secret_mask, aes_key_mask);
 
 	//1、自定义随机16字节数据，base64
-    char iv[16];
-    Get_Random_Str(iv, 16);//最后一字节为\0
+    char iv[17] = {0};
+    Get_Random_Str(iv, 16);//生成16字节随机数据，并保留结尾'\0'
     char iv_base64[32];
     size_t iv_base64_len;
     mbedtls_base64_encode((unsigned char *)iv_base64, sizeof(iv_base64), &iv_base64_len, (unsigned char *)iv, 16);
@@ -67,7 +67,7 @@ int Entity_Get_Encryption_Data(uint8_t type, char *costom_str, char *uuid, char 
 	//3、data数据处理
 	uint32_t current_time = Entity_Get_Time_Stamp();
     //ENTITY_LOGD("current_time:%d\n", current_time);
-    char random[27] = {0};
+    char random[28] = {0};
     Get_Random_Str(random, 27);
 	
 	unsigned char signature[64];
